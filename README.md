@@ -1,17 +1,17 @@
 # ScreenAutomation
 
-An n8n-like node editor driven by screen regions.
+An n8n-like node editor (Rust + egui) driven by screen regions.
 
-- Pick a node type and press **＋ Add**: a node is created and (for OCR / Keyboard / Click nodes)
-  a frameless, translucent overlay window appears with a border and the node name as title.
-  Drag it to move, drag the red corner to resize; **Color** and the **Opacity** slider restyle it.
-- Node types: `ocr` (reads the region when its pixels change), `model` (convert to number/int/text/bool/json),
-  `function` (Python code: use `inputs`, set `result`; `None` stops the flow), `keyboard` (types into the region),
+- **＋ Add** creates a node of the chosen type. Nodes that act on the screen (ocr, keyboard, click) also open a
+  title-bar-less, transparent overlay window with a red border and the node name as its title. Drag to move,
+  drag the red corner to resize; color and opacity are set in the node's settings.
+- Node types: `ocr` (runs tesseract on its region only when the pixels changed), `model` (convert to
+  text/number/int/bool), `function` ([Rhai](https://rhai.rs) script; `inputs` array; last expression is the result,
+  `()` stops the flow, e.g. `if inputs[0] > 10.0 { "go" } else { () }`), `keyboard` (clicks the region, types),
   `click` (clicks the region center).
-- **Connect** links the selected node to a target; **Run** executes the graph every second.
+- Connect nodes, then **Run**; the graph executes every refresh interval. Graphs save/load as JSON.
 
 ```
-pip install -r requirements.txt   # plus tkinter and the tesseract binary
-python -m screenauto
-python -m unittest discover tests
+cargo test                      # core engine, no display needed
+cargo run --features gui        # needs the tesseract binary and system libs (X11, dbus, xdo)
 ```

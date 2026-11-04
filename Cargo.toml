@@ -1,0 +1,23 @@
+[package]
+name = "screen_automation"
+version = "0.1.0"
+edition = "2021"
+description = "n8n-like node automation driven by screen regions"
+
+[features]
+default = []
+# Desktop backends (screen capture, tesseract OCR, input simulation) and the egui UI
+gui = ["dep:eframe", "dep:xcap", "dep:enigo"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rhai = "1"
+eframe = { version = "0.31", optional = true }
+xcap = { version = "0.4", optional = true }
+enigo = { version = "0.3", optional = true }
+
+[[bin]]
+name = "screen_automation"
+path = "src/main.rs"
+required-features = ["gui"]
