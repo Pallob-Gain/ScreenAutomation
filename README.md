@@ -5,13 +5,13 @@ ScreenAutomation is a desktop screen-automation prototype built in Rust. It comb
 The project has two parts:
 
 - A reusable graph engine that can be tested without a desktop display.
-- An optional `egui` desktop application that captures screen regions and sends input through the operating system.
+- An optional native desktop application with an interactive node-canvas editor, screen-region overlays, capture, OCR, and input.
 
 > **Use with care.** A running workflow can click and type into other applications. Review the graph and target regions before pressing **Run**, and press **Stop** before editing or leaving an automation unattended.
 
 ## What it can do
 
-- Capture pixels from a screen region and run Tesseract OCR when that region's pixels change.
+- Capture pixels from a screen region and run OCRS (a Rust OCR engine) when that region's pixels change.
 - Convert text and other values to text, number, integer, or boolean values.
 - Evaluate a Rhai expression or script to make decisions and transform values.
 - Click the center of a configured screen region, or click and type text there.
@@ -21,11 +21,11 @@ The project has two parts:
 
 ## Requirements
 
-- Rust and Cargo (the package uses Rust edition 2021).
-- Tesseract OCR installed and available as the `tesseract` command when using OCR with the desktop backend.
+- Rust and Cargo (Rust 1.92 or newer; the package uses Rust edition 2021).
 - The native system libraries required by `eframe`, `xcap`, and `enigo` on your operating system. On Linux, desktop builds may require X11-related libraries and input/display access.
+- Internet access the first time OCR is used, so the application can download its OCR models. Models are cached in the operating system's application cache directory afterward.
 
-The GUI and real desktop integrations are behind the `gui` Cargo feature. The default build has no desktop backend dependencies enabled.
+The GUI and real desktop integrations are behind the `gui` Cargo feature. The default build has no desktop backend dependencies enabled. The desktop editor uses eframe for native windows and `egui-snarl` for its interactive graph canvas.
 
 ## Build and run
 
@@ -35,26 +35,26 @@ Run the graph-engine tests without launching a GUI:
 cargo test
 ```
 
-Build and launch the desktop application:
+Build and launch the desktop application (release mode is recommended for OCR performance):
 
 ```sh
-cargo run --features gui
+cargo run --release --features gui
 ```
 
-The GUI initializes a desktop input backend when it starts. OCR is performed by invoking the `tesseract` executable; if it is missing, an OCR operation reports an error in the application status area. Screen capture and simulated input also depend on operating-system support, permissions, and the active desktop session.
+The GUI initializes a desktop input backend when it starts. The first OCR operation downloads the OCRS detection and recognition models into the application cache, then loads them locally. A model download or OCR error is shown in the application status area. Screen capture and simulated input also depend on operating-system support, permissions, and the active desktop session.
 
 ## Using the application
 
 1. Start the GUI with `cargo run --features gui`.
-2. Choose a node type from the type selector and press **＋ Add**. A node is added to the list with a generated name.
-3. Select a node to edit its settings. Use its **Connect** controls to connect it to another node. The interface displays outgoing connections alongside node names.
-4. For OCR, keyboard, and click nodes, position and resize the transparent on-screen region window. Drag inside the window to move it; drag its red lower-right grip to resize it. The region is used both for screen capture and as the target location for actions.
+2. Choose a node type from the type selector and press **＋ Add node**. The node appears on the canvas with a generated name.
+3. Drag nodes to arrange the workflow. Drag from an output pin to an input pin to create an edge; use the graph editor's pin controls to remove or reroute connections. Use the canvas zoom and pan controls to navigate larger workflows.
+4. Select a node in the canvas to edit its settings in the side panel. For OCR, keyboard, and click nodes, position and resize the transparent on-screen region window. Drag inside the window to move it; drag its lower-right grip to resize it. The region is used both for screen capture and as the target location for actions.
 5. Configure the refresh interval, then press **Run**. Press **Stop** to pause execution.
 6. Enter a file path in the save/load field and use **Save** or **Load** to persist or restore the graph. The default path is `graph.json`.
 
-Region-bearing nodes start with a region at screen position `(100, 100)` and size `300 × 120` pixels. Their overlay color and opacity can be adjusted in the selected node's settings. The red outline and grip indicate the target region; the configured fill color and opacity control the overlay fill.
+Region-bearing nodes start with a region at screen position `(100, 100)` and size `300 × 120` pixels. Their overlay color and opacity can be adjusted in the selected node's settings. Opacity applies to the complete overlay (fill, outline, label, and resize grip), not only the fill color.
 
-The editor is currently a node list with connection controls, not a free-form canvas: connections are represented as text rather than drawn as graph edges.
+Node positions are saved with the workflow. Existing workflow files that do not contain positions are laid out automatically when loaded.
 
 ## Node types
 
@@ -97,7 +97,7 @@ With an OCR node upstream, the function receives the numeric value produced by t
 
 ## Saving and loading
 
-The application serializes graphs as readable JSON. A graph contains its nodes and directed connections. Node data includes its name, type-specific settings, optional screen region, overlay color, and opacity. OCR's in-memory pixel-change cache is not persisted, so a loaded OCR node establishes its baseline when it next runs.
+The application serializes graphs as readable JSON. A graph contains its nodes and directed connections. Node data includes its name, type-specific settings, canvas position, optional screen region, overlay color, and opacity. OCR's in-memory pixel-change cache is not persisted, so a loaded OCR node establishes its baseline when it next runs.
 
 Use the **Save** and **Load** controls in the desktop app to write or read the JSON file at the path shown in the file field. Loading replaces the current graph. Keep a backup of workflows you want to preserve.
 
@@ -116,10 +116,10 @@ Implement `Backend` to connect the engine to another environment or to a test do
 ```text
 src/
   backend.rs   Screen-region type and OS-access abstraction
-  desktop.rs   Optional real desktop capture, Tesseract OCR, and input backend
+  desktop.rs   Optional real desktop capture, OCRS engine, and input backend
   graph.rs     Graph operations, ordering, persistence, and execution
   lib.rs       Library module exports
-  main.rs      Optional egui desktop application
+  main.rs      Optional eframe application and egui-snarl graph editor
   node.rs      Node kinds, values, conversions, and processing
 tests/
   graph.rs     Graph execution, change-detection, and JSON/cycle tests
@@ -127,4 +127,4 @@ tests/
 
 ## Current scope
 
-ScreenAutomation is an early, deliberately small automation tool rather than a full workflow platform. The desktop editor does not draw graph edges or show a live graph execution trace or per-node output inspector. It does not currently provide workflow scheduling outside the running application, remote execution, or a built-in mechanism for selecting regions from inside another process. The graph engine and backend trait are intended to keep the core workflow logic testable and make alternate integrations possible.
+ScreenAutomation is an early, deliberately small automation tool rather than a full workflow platform. The editor provides a visual node canvas and direct screen-region overlays, but does not show a live graph execution trace or per-node output inspector. It does not currently provide workflow scheduling outside the running application, remote execution, or a built-in mechanism for selecting regions from inside another process. The graph engine and backend trait are intended to keep the core workflow logic testable and make alternate integrations possible.
