@@ -16,6 +16,7 @@ gui = [
     "dep:rten",
     "dep:directories",
     "dep:ureq",
+    "dep:windows-sys",
 ]
 
 [dependencies]
@@ -30,6 +31,9 @@ ocrs = { version = "0.13", optional = true }
 rten = { version = "0.26", optional = true }
 directories = { version = "6", optional = true }
 ureq = { version = "2.12", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [[bin]]
 name = "screen_automation"

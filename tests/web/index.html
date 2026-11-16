@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ScreenAutomation Test Page</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    font-family: Segoe UI, Arial, sans-serif;
+    background: #f4f5f7;
+    color: #111;
+  }
+  h1 { margin: 0 0 16px; font-size: 22px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+  .card {
+    background: #fff;
+    border: 1px solid #d0d4da;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 16px; color: #444; }
+  #price {
+    display: inline-block;
+    min-width: 280px;
+    padding: 12px 20px;
+    background: #fff;
+    color: #000;
+    border: 2px solid #000;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 48px;
+    font-weight: bold;
+    letter-spacing: 1px;
+  }
+  #price.up { color: #0a7d28; }
+  #price.down { color: #c0161d; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  label { min-width: 140px; }
+  input[type="number"], select {
+    width: 160px;
+    padding: 6px 8px;
+    font-size: 16px;
+    border: 1px solid #999;
+    border-radius: 4px;
+  }
+  button {
+    padding: 10px 18px;
+    font-size: 16px;
+    border: 1px solid #555;
+    border-radius: 6px;
+    background: #e9ecef;
+    cursor: pointer;
+  }
+  button:active { background: #cdd3d9; }
+  .big-btn { padding: 24px 40px; font-size: 24px; font-weight: bold; }
+  #btn1 { background: #cfe3ff; }
+  #btn2 { background: #ffe0c2; }
+  .counter {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 32px;
+    font-weight: bold;
+    min-width: 80px;
+  }
+  .status { font-size: 13px; color: #666; }
+  .status.error { color: #c0161d; }
+  #log {
+    height: 160px;
+    overflow-y: auto;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    background: #fafafa;
+    border: 1px solid #ddd;
+    padding: 6px;
+    white-space: pre;
+  }
+</style>
+</head>
+<body>
+<h1>ScreenAutomation Test Page</h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>Price feed</h2>
+    <div id="price">--</div>
+    <div class="row">
+      <label for="source">Source</label>
+      <select id="source">
+        <optgroup label="Real-time streams (WebSocket)">
+          <option value="ws:kraken:ETH/USD">ETH/USD order-book microprice (Kraken, fastest)</option>
+          <option value="ws:kraken:BTC/USD">BTC/USD order-book microprice (Kraken)</option>
+          <option value="ws:kraken:SOL/USD">SOL/USD order-book microprice (Kraken)</option>
+          <option value="ws:coinbase:BTC-USD">BTC-USD trades (Coinbase)</option>
+          <option value="ws:coinbase:ETH-USD">ETH-USD trades (Coinbase)</option>
+          <option value="ws:coinbase:XRP-USD">XRP-USD trades (Coinbase)</option>
+        </optgroup>
+        <optgroup label="Polled (REST, at most once per second)">
+          <option value="coinbase">BTC-USD spot (Coinbase)</option>
+          <option value="binance">BTC-USDT (Binance, blocked in the US)</option>
+        </optgroup>
+        <optgroup label="Offline">
+          <option value="sim">Simulated (random walk)</option>
+        </optgroup>
+      </select>
+    </div>
+    <div class="row">
+      <label for="interval">Update interval (ms)</label>
+      <input id="interval" type="number" min="100" step="100" value="200">
+    </div>
+    <div class="row">
+      <button id="pause">Pause</button>
+      <span id="status" class="status">Starting…</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Thresholds</h2>
+    <div class="row">
+      <label for="upper">Upper threshold</label>
+      <input id="upper" type="number" step="any">
+    </div>
+    <div class="row">
+      <label for="lower">Lower threshold</label>
+      <input id="lower" type="number" step="any">
+    </div>
+    <div class="row">
+      <label>Crossed above upper</label>
+      <span id="aboveCount" class="counter">0</span>
+    </div>
+    <div class="row">
+      <label>Crossed below lower</label>
+      <span id="belowCount" class="counter">0</span>
+    </div>
+    <div class="row">
+      <button id="resetThresholds">Reset threshold counters</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Buttons</h2>
+    <div class="row">
+      <button id="btn1" class="big-btn">Button 1</button>
+      <span id="btn1Count" class="counter">0</span>
+    </div>
+    <div class="row">
+      <button id="btn2" class="big-btn">Button 2</button>
+      <span id="btn2Count" class="counter">0</span>
+    </div>
+    <div class="row">
+      <button id="resetButtons">Reset click counters</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Event log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const priceEl = $("price");
+  const statusEl = $("status");
+  const logEl = $("log");
+
+  let price = null;
+  let timer = null;
+  let paused = false;
+  let aboveCount = 0;
+  let belowCount = 0;
+  let btn1Count = 0;
+  let btn2Count = 0;
+
+  // WebSocket stream state: the socket pushes every trade; the display samples `latest`.
+  let socket = null;
+  let latest = null;
+  let streamError = null;
+  let streamUpdates = 0;
+  let rateSince = performance.now();
+  let reconnectTimer = null;
+
+  // Enough decimals that small moves stay visible, e.g. DOGE at 0.12345.
+  function fmt(v) {
+    let digits = v < 1 ? 5 : v < 10 ? 4 : v < 1000 ? 3 : 2;
+    // The order-book microprice moves within a 1-cent spread, so show finer detail.
+    if ($("source").value.startsWith("ws:kraken:")) digits += 2;
+    return v.toFixed(digits);
+  }
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(msg, isError = false) {
+    statusEl.textContent = msg;
+    statusEl.className = "status" + (isError ? " error" : "");
+  }
+
+  function readNumber(el) {
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : null;
+  }
+
+  // Counts a crossing only on the transition, not on every tick spent beyond the threshold.
+  function checkThresholds(prev, cur) {
+    if (prev === null) return;
+    const upper = readNumber($("upper"));
+    const lower = readNumber($("lower"));
+    if (upper !== null && prev <= upper && cur > upper) {
+      aboveCount++;
+      $("aboveCount").textContent = aboveCount;
+      log(`Crossed ABOVE upper ${upper}: ${fmt(prev)} -> ${fmt(cur)}`);
+    }
+    if (lower !== null && prev >= lower && cur < lower) {
+      belowCount++;
+      $("belowCount").textContent = belowCount;
+      log(`Crossed BELOW lower ${lower}: ${fmt(prev)} -> ${fmt(cur)}`);
+    }
+  }
+
+  function setPrice(next) {
+    const prev = price;
+    price = next;
+    priceEl.textContent = fmt(next);
+    priceEl.className = prev === null || next === prev ? "" : next > prev ? "up" : "down";
+
+    // Seed thresholds around the first value so crossings are easy to trigger.
+    if (prev === null) {
+      if ($("upper").value === "") $("upper").value = fmt(next * 1.0005);
+      if ($("lower").value === "") $("lower").value = fmt(next * 0.9995);
+    }
+    checkThresholds(prev, next);
+  }
+
+  async function fetchJson(url) {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  const sources = {
+    coinbase: async () => {
+      const j = await fetchJson("https://api.coinbase.com/v2/prices/BTC-USD/spot");
+      return parseFloat(j.data.amount);
+    },
+    binance: async () => {
+      const j = await fetchJson("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+      return parseFloat(j.price);
+    },
+    sim: async () => {
+      const base = price ?? 100;
+      const step = base * 0.002 * (Math.random() * 2 - 1);
+      return Math.max(0.01, base + step);
+    },
+  };
+
+  function closeStream() {
+    clearTimeout(reconnectTimer);
+    if (socket) {
+      const old = socket;
+      socket = null;
+      old.close();
+    }
+  }
+
+  function openStream(spec) {
+    closeStream();
+    const [, exchange, symbol] = spec.split(":");
+    latest = null;
+    streamError = null;
+    let ws;
+    if (exchange === "coinbase") {
+      ws = new WebSocket("wss://ws-feed.exchange.coinbase.com");
+      ws.onopen = () =>
+        ws.send(JSON.stringify({ type: "subscribe", product_ids: [symbol], channels: ["ticker"] }));
+      ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.type === "ticker") update(parseFloat(m.price));
+        else if (m.type === "error") streamError = m.message || "subscription error";
+      };
+    } else {
+      // Microprice from the top of the order book (bid/ask midpoint weighted by size), so it
+      // moves whenever the best bid or ask changes, not only on trades.
+      const bids = new Map();
+      const asks = new Map();
+      const apply = (book, levels) => {
+        for (const { price, qty } of levels || []) {
+          if (qty === 0) book.delete(price);
+          else book.set(price, qty);
+        }
+      };
+      const best = (book, better) => {
+        let top = null;
+        for (const price of book.keys()) if (top === null || better(price, top)) top = price;
+        return top;
+      };
+      ws = new WebSocket("wss://ws.kraken.com/v2");
+      ws.onopen = () =>
+        ws.send(JSON.stringify({ method: "subscribe", params: { channel: "book", symbol: [symbol], depth: 10 } }));
+      ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.success === false) streamError = m.error || "subscription error";
+        if (m.channel !== "book" || !m.data) return;
+        if (m.type === "snapshot") {
+          bids.clear();
+          asks.clear();
+        }
+        for (const d of m.data) {
+          apply(bids, d.bids);
+          apply(asks, d.asks);
+        }
+        const bid = best(bids, (a, b) => a > b);
+        const ask = best(asks, (a, b) => a < b);
+        if (bid === null || ask === null) return;
+        const bidQty = bids.get(bid);
+        const askQty = asks.get(ask);
+        update((bid * askQty + ask * bidQty) / (bidQty + askQty));
+      };
+    }
+    function update(v) {
+      if (socket !== ws || !Number.isFinite(v)) return;
+      latest = v;
+      streamError = null;
+      streamUpdates++;
+    }
+    ws.onerror = () => {
+      if (socket === ws) streamError = "connection error";
+    };
+    ws.onclose = () => {
+      if (socket !== ws) return;
+      streamError = streamError || "connection closed";
+      reconnectTimer = setTimeout(() => {
+        if (socket === ws) openStream(spec);
+      }, 2000);
+    };
+    socket = ws;
+    ws.spec = spec;
+    streamUpdates = 0;
+    rateSince = performance.now();
+  }
+
+  function streamTick(source) {
+    if (streamError) {
+      setStatus(`${source} failed: ${streamError}. Reconnecting…`, true);
+      return;
+    }
+    if (latest === null) {
+      setStatus(`Connecting to ${source}…`);
+      return;
+    }
+    setPrice(latest);
+    const now = performance.now();
+    const seconds = (now - rateSince) / 1000;
+    if (seconds >= 1) {
+      const rate = (streamUpdates / seconds).toFixed(1);
+      setStatus(`${source.split(":").slice(1).join(" ")} • ${rate} updates/s • ${new Date().toLocaleTimeString()}`);
+      streamUpdates = 0;
+      rateSince = now;
+    }
+  }
+
+  async function tick() {
+    if (paused) return;
+    const source = $("source").value;
+    if (source.startsWith("ws:")) {
+      streamTick(source);
+      return;
+    }
+    try {
+      const v = await sources[source]();
+      if (!Number.isFinite(v)) throw new Error("invalid value");
+      setPrice(v);
+      setStatus(`${source} @ ${new Date().toLocaleTimeString()}`);
+    } catch (e) {
+      setStatus(`${source} failed: ${e.message} (switch to Simulated if offline)`, true);
+    }
+  }
+
+  function interval() {
+    const v = readNumber($("interval"));
+    const source = $("source").value;
+    const min = source === "sim" || source.startsWith("ws:") ? 100 : 1000; // stay polite to REST APIs
+    return Math.max(min, v ?? 1000);
+  }
+
+  function restart() {
+    clearInterval(timer);
+    const source = $("source").value;
+    if (source.startsWith("ws:")) {
+      if (!socket || socket.spec !== source) openStream(source);
+    } else {
+      closeStream();
+    }
+    tick();
+    timer = setInterval(tick, interval());
+  }
+
+  $("source").addEventListener("change", () => {
+    // A different asset has a different price scale, so start the thresholds fresh.
+    price = null;
+    $("upper").value = "";
+    $("lower").value = "";
+    priceEl.textContent = "--";
+    log(`Source changed to ${$("source").value}; thresholds reset`);
+    restart();
+  });
+  $("interval").addEventListener("change", () => {
+    log(`Interval set to ${interval()} ms`);
+    restart();
+  });
+  $("pause").addEventListener("click", () => {
+    paused = !paused;
+    $("pause").textContent = paused ? "Resume" : "Pause";
+    setStatus(paused ? "Paused" : "Resumed");
+    if (!paused) restart();
+  });
+  $("upper").addEventListener("change", () => log(`Upper threshold = ${$("upper").value}`));
+  $("lower").addEventListener("change", () => log(`Lower threshold = ${$("lower").value}`));
+
+  $("btn1").addEventListener("click", () => {
+    btn1Count++;
+    $("btn1Count").textContent = btn1Count;
+    log(`Button 1 clicked (${btn1Count})`);
+  });
+  $("btn2").addEventListener("click", () => {
+    btn2Count++;
+    $("btn2Count").textContent = btn2Count;
+    log(`Button 2 clicked (${btn2Count})`);
+  });
+  $("resetButtons").addEventListener("click", () => {
+    btn1Count = btn2Count = 0;
+    $("btn1Count").textContent = $("btn2Count").textContent = "0";
+    log("Click counters reset");
+  });
+  $("resetThresholds").addEventListener("click", () => {
+    aboveCount = belowCount = 0;
+    $("aboveCount").textContent = $("belowCount").textContent = "0";
+    log("Threshold counters reset");
+  });
+
+  restart();
+})();
+</script>
+</body>
+</html>
