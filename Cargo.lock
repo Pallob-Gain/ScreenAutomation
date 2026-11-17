@@ -3232,6 +3232,7 @@ dependencies = [
  "ocrs",
  "rhai",
  "rten",
+ "rten-imageproc",
  "serde",
  "serde_json",
  "ureq",

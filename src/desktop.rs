@@ -4,6 +4,7 @@ use directories::ProjectDirs;
 use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
+use rten_imageproc::{RectF, RotatedRect};
 use std::path::{Path, PathBuf};
 
 pub struct Desktop {
@@ -153,6 +154,69 @@ fn crop_rgb(
     Ok(out)
 }
 
+fn recognize_single_line(
+    engine: &OcrEngine,
+    region: &Region,
+    pixels: &[u8],
+) -> Result<String, String> {
+    if region.width == 0 || region.height == 0 {
+        return Err("Single-line OCR requires a non-empty region".into());
+    }
+    let (pixels, width, height) = prepare_single_line(pixels, region.width, region.height)?;
+    if pixels.is_empty() {
+        return Ok(String::new());
+    }
+    let image = ImageSource::from_bytes(&pixels, (width, height))
+        .map_err(|e| e.to_string())?;
+    let input = engine.prepare_input(image).map_err(|e| e.to_string())?;
+    // Keep punctuation inside the recognition crop instead of relying on word detection.
+    let line = RotatedRect::from_rect(RectF::from_tlhw(0.0, 0.0, height as f32, width as f32));
+    let lines = engine
+        .recognize_text(&input, &[vec![line]])
+        .map_err(|e| e.to_string())?;
+    Ok(lines
+        .into_iter()
+        .flatten()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join(""))
+}
+
+fn prepare_single_line(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, u32, u32), String> {
+    ImageSource::from_bytes(pixels, (width, height)).map_err(|e| e.to_string())?;
+    if width == 0 || height == 0 {
+        return Err("Single-line OCR requires a non-empty region".into());
+    }
+    // Single-line regions have a plain background and a small margin around the text.
+    let background = &pixels[..3];
+    let invert = background.iter().map(|&v| u32::from(v)).sum::<u32>() < 3 * 128;
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for (index, pixel) in pixels.chunks_exact(3).enumerate() {
+        if pixel.iter().zip(background).any(|(&a, &b)| a.abs_diff(b) > 32) {
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            left = left.min(x);
+            right = right.max(x + 1);
+            top = top.min(y);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    if right == 0 {
+        return Ok((Vec::new(), 0, 0));
+    }
+    left = left.saturating_sub(2);
+    top = top.saturating_sub(2);
+    right = (right + 2).min(width);
+    bottom = (bottom + 2).min(height);
+    let mut out = Vec::with_capacity(((right - left) * (bottom - top) * 3) as usize);
+    for y in top..bottom {
+        let start = ((y * width + left) * 3) as usize;
+        let end = ((y * width + right) * 3) as usize;
+        out.extend(pixels[start..end].iter().map(|&v| if invert { 255 - v } else { v }));
+    }
+    Ok((out, right - left, bottom - top))
+}
+
 impl Backend for Desktop {
     fn capture(&mut self, r: &Region) -> Result<Vec<u8>, String> {
         let mon = xcap::Monitor::from_point(r.x, r.y).map_err(|e| e.to_string())?;
@@ -182,6 +246,10 @@ impl Backend for Desktop {
         engine.get_text(&input).map_err(|e| e.to_string())
     }
 
+    fn ocr_single_line(&mut self, region: &Region, pixels: &[u8]) -> Result<String, String> {
+        recognize_single_line(self.ocr_engine()?, region, pixels)
+    }
+
     fn type_text(&mut self, text: &str) -> Result<(), String> {
         self.enigo.text(text).map_err(|e| e.to_string())
     }
@@ -204,6 +272,26 @@ impl Backend for Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_preparation_keeps_isolated_decimal_and_normalizes_polarity() {
+        let mut dark = vec![0; 10 * 8 * 3];
+        for (x, y) in [(3, 3), (6, 3), (6, 5)] {
+            dark[(y * 10 + x) * 3..(y * 10 + x) * 3 + 3].fill(255);
+        }
+        let light: Vec<u8> = dark.iter().map(|&v| 255 - v).collect();
+        let (prepared, width, height) = prepare_single_line(&dark, 10, 8).unwrap();
+        assert_eq!((width, height), (8, 7));
+        let dot = (4 * width as usize + 5) * 3;
+        assert_eq!(&prepared[dot..dot + 3], &[0, 0, 0]);
+        assert_eq!(
+            prepare_single_line(&light, 10, 8).unwrap(),
+            (prepared, width, height)
+        );
+        assert_eq!(prepare_single_line(&[255; 12], 2, 2).unwrap(), (vec![], 0, 0));
+        assert!(prepare_single_line(&[0; 2], 2, 2).is_err());
+        assert!(prepare_single_line(&[], 0, 0).is_err());
+    }
 
     #[test]
     fn finds_model_in_first_folder_that_has_it() {

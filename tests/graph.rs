@@ -31,8 +31,44 @@ impl Backend for Fake {
 }
 
 #[test]
+fn inclusive_thresholds_trigger_at_equality_and_keep_hysteresis() {
+    let mut backend = Fake::default();
+    for (trigger, values) in [
+        (Crossing::RisingOrEqual, [95.0, 100.0, 100.0, 95.0, 100.0, 89.0, 100.0]),
+        (Crossing::FallingOrEqual, [95.0, 90.0, 90.0, 95.0, 90.0, 101.0, 90.0]),
+    ] {
+        let mut node = Node::new("threshold", Kind::Threshold {
+            upper: 100.0, lower: 90.0, trigger, band: None,
+        });
+        assert_eq!(node.process(&[Value::Num(f64::NAN)], &mut backend).unwrap(), None);
+        for (value, expected) in values.into_iter().zip([false, true, false, false, false, false, true]) {
+            let result = node.process(&[Value::Num(value)], &mut backend).unwrap();
+            assert_eq!(result, expected.then_some(Value::Num(value)), "{trigger:?} at {value}");
+        }
+        let json = serde_json::to_string(&node).unwrap();
+        let mut restored: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.process(&[Value::Num(values[1])], &mut backend).unwrap(), None,
+            "first reading at equality must not trigger, including after reload");
+    }
+}
+
+#[test]
+fn single_line_ocr_errors_are_retried_and_old_workflows_default_to_multiline() {
+    let mut node: Node = serde_json::from_str(
+        r#"{"name":"ocr","type":"ocr","color":[0,170,255],"opacity":0.3}"#
+    ).unwrap();
+    assert!(matches!(node.kind, Kind::Ocr { single_line: false, .. }));
+    node.kind = Kind::Ocr { single_line: true, last_hash: None };
+    let mut backend = Fake::default();
+    for _ in 0..2 {
+        assert_eq!(node.process(&[], &mut backend).unwrap_err(),
+            "Single-line OCR is not supported by this backend");
+    }
+}
+
+#[test]
 fn failed_ocr_is_retried_for_unchanged_pixels() {
-    let mut node = Node::new("ocr", Kind::Ocr { last_hash: None });
+    let mut node = Node::new("ocr", Kind::Ocr { single_line: false, last_hash: None });
     let mut backend = Fake {
         screen: "12:34".into(),
         fail_ocr: true,
@@ -50,7 +86,7 @@ fn failed_ocr_is_retried_for_unchanged_pixels() {
 #[test]
 fn compare_triggers_click_on_threshold() {
     let mut g = Graph::default();
-    g.add_node(Node::new("ocr", Kind::Ocr { last_hash: None }))
+    g.add_node(Node::new("ocr", Kind::Ocr { single_line: false, last_hash: None }))
         .unwrap();
     g.add_node(Node::new(
         "cmp",
@@ -145,7 +181,7 @@ fn compare_operators() {
 
 fn build() -> Graph {
     let mut g = Graph::default();
-    g.add_node(Node::new("ocr", Kind::Ocr { last_hash: None }))
+    g.add_node(Node::new("ocr", Kind::Ocr { single_line: false, last_hash: None }))
         .unwrap();
     g.add_node(Node::new(
         "num",

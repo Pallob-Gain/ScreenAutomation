@@ -239,7 +239,9 @@ fn node_label(node: &Node) -> String {
             ..
         } => match trigger {
             Crossing::Rising => format!("{}  ↑ {upper}", node.name),
+            Crossing::RisingOrEqual => format!("{}  ≥ {upper}", node.name),
             Crossing::Falling => format!("{}  ↓ {lower}", node.name),
+            Crossing::FallingOrEqual => format!("{}  ≤ {lower}", node.name),
             Crossing::Both => format!("{}  ↑ {upper} ↓ {lower}", node.name),
         },
         _ => node.name.clone(),
@@ -265,7 +267,9 @@ fn node_description(node: &Node) -> String {
             ..
         } => match trigger {
             Crossing::Rising => format!("Trigger when input rises above {upper}"),
+            Crossing::RisingOrEqual => format!("Trigger when input rises to or above {upper}"),
             Crossing::Falling => format!("Trigger when input falls below {lower}"),
+            Crossing::FallingOrEqual => format!("Trigger when input falls to or below {lower}"),
             Crossing::Both => {
                 format!("Trigger when input rises above {upper} or falls below {lower}")
             }
@@ -381,7 +385,7 @@ enum CanvasIcon {
 
 fn new_kind(i: usize) -> Kind {
     match i {
-        0 => Kind::Ocr { last_hash: None },
+        0 => Kind::Ocr { single_line: false, last_hash: None },
         1 => Kind::Model {
             format: Format::Number,
         },
@@ -858,8 +862,8 @@ impl App {
                             );
                         }
                         settings.weak(
-                            "Triggers when the value moves from at or below the upper threshold \
-                             to above it, or from at or above the lower threshold to below it. \
+                            "Triggers above the upper threshold or below the lower threshold. \
+                             The >= and <= options also trigger at equality. \
                              After a crossing, the value must cross the other threshold before \
                              the same direction can trigger again. The first reading never \
                              triggers. When it triggers, the input is passed on.",
@@ -876,8 +880,18 @@ impl App {
                         settings.label("Mouse button");
                         settings.text_edit_singleline(button);
                     }
-                    Kind::Ocr { .. } => {
+                    Kind::Ocr { single_line, last_hash } => {
                         settings.label("Reads text from its screen region.");
+                        if settings.checkbox(single_line, "Single line (prices / numbers)").changed() {
+                            *last_hash = None;
+                        }
+                        settings.weak(
+                            "For one price, enable single-line mode and fit the region around \
+                             the entire number with a small plain-background margin. \
+                             Exclude other text and icons. \
+                             This bypasses layout detection so decimal fragments stay in order. \
+                             It cannot guarantee that every decimal point is recognized.",
+                        );
                     }
                 }
                 if node.region.is_some() {
@@ -1553,7 +1567,7 @@ mod tests {
 
         let mut graph = Graph::default();
         graph
-            .add_node(Node::new("source", Kind::Ocr { last_hash: None }))
+            .add_node(Node::new("source", Kind::Ocr { single_line: false, last_hash: None }))
             .unwrap();
         graph
             .add_node(Node::new(

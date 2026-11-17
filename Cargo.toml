@@ -14,6 +14,7 @@ gui = [
     "dep:enigo",
     "dep:ocrs",
     "dep:rten",
+    "dep:rten-imageproc",
     "dep:directories",
     "dep:ureq",
     "dep:windows-sys",
@@ -29,6 +30,7 @@ xcap = { version = "0.4", optional = true }
 enigo = { version = "0.3", optional = true }
 ocrs = { version = "0.13", optional = true }
 rten = { version = "0.26", optional = true }
+rten-imageproc = { version = "0.26", optional = true }
 directories = { version = "6", optional = true }
 ureq = { version = "2.12", optional = true }
 

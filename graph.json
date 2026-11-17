@@ -1,0 +1,141 @@
+{
+  "nodes": [
+    {
+      "name": "ocr1",
+      "type": "ocr",
+      "single_line": false,
+      "position": [
+        80.0,
+        80.0
+      ],
+      "region": {
+        "x": 754,
+        "y": 238,
+        "width": 288,
+        "height": 80
+      },
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "model2",
+      "type": "model",
+      "format": "number",
+      "position": [
+        72.0,
+        194.40001
+      ],
+      "region": null,
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "threshold3",
+      "type": "threshold",
+      "upper": 1809.6809,
+      "lower": 1807.8721,
+      "trigger": "rising",
+      "position": [
+        280.00003,
+        93.6
+      ],
+      "region": null,
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "threshold4",
+      "type": "threshold",
+      "upper": 1809.6809,
+      "lower": 1807.8721,
+      "trigger": "falling",
+      "position": [
+        280.8,
+        179.6
+      ],
+      "region": null,
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "click5",
+      "type": "click",
+      "button": "left",
+      "position": [
+        525.6,
+        93.99999
+      ],
+      "region": {
+        "x": 753,
+        "y": 603,
+        "width": 177,
+        "height": 76
+      },
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "click6",
+      "type": "click",
+      "button": "left",
+      "position": [
+        528.0,
+        181.2
+      ],
+      "region": {
+        "x": 757,
+        "y": 695,
+        "width": 173,
+        "height": 69
+      },
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    }
+  ],
+  "edges": [
+    [
+      "ocr1",
+      "model2"
+    ],
+    [
+      "model2",
+      "threshold3"
+    ],
+    [
+      "model2",
+      "threshold4"
+    ],
+    [
+      "threshold3",
+      "click5"
+    ],
+    [
+      "threshold4",
+      "click6"
+    ]
+  ]
+}

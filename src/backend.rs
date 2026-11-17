@@ -26,6 +26,10 @@ pub trait Backend {
     fn capture(&mut self, region: &Region) -> Result<Vec<u8>, String>;
     /// Text recognised in the pixels returned by `capture`.
     fn ocr(&mut self, region: &Region, pixels: &[u8]) -> Result<String, String>;
+    /// Recognizes the region as one line, without automatic layout detection.
+    fn ocr_single_line(&mut self, _: &Region, _: &[u8]) -> Result<String, String> {
+        Err("Single-line OCR is not supported by this backend".into())
+    }
     fn type_text(&mut self, text: &str) -> Result<(), String>;
     fn click(&mut self, x: i32, y: i32, button: &str) -> Result<(), String>;
 }

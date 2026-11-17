@@ -116,17 +116,27 @@ impl CompareOp {
 #[serde(rename_all = "lowercase")]
 pub enum Crossing {
     Rising,
+    RisingOrEqual,
     Falling,
+    FallingOrEqual,
     Both,
 }
 
 impl Crossing {
-    pub const ALL: [Crossing; 3] = [Crossing::Rising, Crossing::Falling, Crossing::Both];
+    pub const ALL: [Crossing; 5] = [
+        Crossing::Rising,
+        Crossing::RisingOrEqual,
+        Crossing::Falling,
+        Crossing::FallingOrEqual,
+        Crossing::Both,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Crossing::Rising => "Rises above upper",
+            Crossing::RisingOrEqual => "Rises to or above upper (>=)",
             Crossing::Falling => "Falls below lower",
+            Crossing::FallingOrEqual => "Falls to or below lower (<=)",
             Crossing::Both => "Rises above upper or falls below lower",
         }
     }
@@ -149,6 +159,8 @@ fn default_true() -> bool {
 pub enum Kind {
     /// Reads its region when the pixels change.
     Ocr {
+        #[serde(default)]
+        single_line: bool,
         #[serde(skip)]
         last_hash: Option<u64>,
     },
@@ -238,7 +250,7 @@ impl Node {
     ) -> Result<Option<Value>, String> {
         let region = self.region.unwrap_or_default();
         match &mut self.kind {
-            Kind::Ocr { last_hash } => {
+            Kind::Ocr { single_line, last_hash } => {
                 let pixels = backend.capture(&region)?;
                 eprintln!(
                     "[OCR] Region: ({}, {}) {}x{}, Pixels captured: {} bytes",
@@ -255,7 +267,11 @@ impl Node {
                     eprintln!("[OCR] No change detected (hash match)");
                     return Ok(None);
                 }
-                let result = backend.ocr(&region, &pixels)?;
+                let result = if *single_line {
+                    backend.ocr_single_line(&region, &pixels)?
+                } else {
+                    backend.ocr(&region, &pixels)?
+                };
                 *last_hash = Some(hash);
                 eprintln!("[OCR] Recognition result: '{}'", result);
                 Ok(Some(Value::Text(result.trim().into())))
@@ -310,19 +326,27 @@ impl Node {
                 let Some(input) = inputs.first() else {
                     return Ok(None);
                 };
-                if lower > upper {
-                    eprintln!("[THRESHOLD] Lower {lower} is above upper {upper}");
+                if !lower.is_finite() || !upper.is_finite() || lower > upper {
+                    eprintln!("[THRESHOLD] Thresholds must be finite and lower <= upper");
                     return Ok(None);
                 }
                 let Some(v) = as_number(input) else {
                     eprintln!("[THRESHOLD] No number in '{}'", input.to_text());
                     return Ok(None);
                 };
+                if !v.is_finite() {
+                    eprintln!("[THRESHOLD] Input must be a finite number");
+                    return Ok(None);
+                }
                 let previous = *band;
                 // Between the thresholds the last band is kept; that is the hysteresis.
-                let current = if v > *upper {
+                let current = if v > *upper
+                    || (*trigger == Crossing::RisingOrEqual && v == *upper)
+                {
                     Band::Above
-                } else if v < *lower {
+                } else if v < *lower
+                    || (*trigger == Crossing::FallingOrEqual && v == *lower)
+                {
                     Band::Below
                 } else {
                     previous.unwrap_or(Band::Between)
@@ -333,7 +357,15 @@ impl Node {
                     (Some(p), Band::Below) if p != Band::Below => Some(Crossing::Falling),
                     _ => None,
                 };
-                let fire = crossed.is_some_and(|c| *trigger == Crossing::Both || *trigger == c);
+                let fire = crossed.is_some_and(|c| {
+                    *trigger == Crossing::Both
+                        || *trigger == c
+                        || matches!(
+                            (*trigger, c),
+                            (Crossing::RisingOrEqual, Crossing::Rising)
+                                | (Crossing::FallingOrEqual, Crossing::Falling)
+                        )
+                });
                 eprintln!(
                     "[THRESHOLD] {v} (lower {lower}, upper {upper}) {current:?}{}",
                     match (crossed, fire) {
