@@ -111,7 +111,7 @@ impl CompareOp {
     }
 }
 
-/// Which threshold crossings make a Threshold node trigger.
+/// Which threshold crossings make a threshold or hysteresis node trigger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Crossing {
@@ -120,16 +120,24 @@ pub enum Crossing {
     Falling,
     FallingOrEqual,
     Both,
+    EnteringRange,
+    EnteringRangeInclusive,
 }
 
 impl Crossing {
-    pub const ALL: [Crossing; 5] = [
+    pub const ALL: [Crossing; 7] = [
         Crossing::Rising,
         Crossing::RisingOrEqual,
         Crossing::Falling,
         Crossing::FallingOrEqual,
         Crossing::Both,
+        Crossing::EnteringRange,
+        Crossing::EnteringRangeInclusive,
     ];
+
+    pub fn is_range(self) -> bool {
+        matches!(self, Self::EnteringRange | Self::EnteringRangeInclusive)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -138,11 +146,13 @@ impl Crossing {
             Crossing::Falling => "Falls below lower",
             Crossing::FallingOrEqual => "Falls to or below lower (<=)",
             Crossing::Both => "Rises above upper or falls below lower",
+            Crossing::EnteringRange => "Enters range (lower < value < upper)",
+            Crossing::EnteringRangeInclusive => "Enters range (lower <= value <= upper)",
         }
     }
 }
 
-/// Last band a Threshold node saw the input in.
+/// Last band a threshold or hysteresis node saw the input in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Band {
     Below,
@@ -168,6 +178,10 @@ pub enum Kind {
     Model {
         format: Format,
     },
+    Constant {
+        value: String,
+        format: Format,
+    },
     /// Rhai script: `inputs` array in scope; the last expression is the result. `()` stops the flow.
     Function {
         code: String,
@@ -182,9 +196,32 @@ pub enum Kind {
         #[serde(skip)]
         last: Option<bool>,
     },
+    #[serde(rename = "compare_inputs")]
+    CompareInputs {
+        op: CompareOp,
+        #[serde(default = "default_true")]
+        trigger_when: bool,
+        #[serde(default = "default_true")]
+        on_change: bool,
+        #[serde(skip)]
+        last: Option<bool>,
+        #[serde(skip)]
+        values: [Option<Value>; 2],
+    },
     /// Hysteresis trigger: passes the input on when it crosses above `upper` or below `lower`.
     /// After crossing one threshold it must cross the other before that direction can trigger
     /// again, so noise around a single threshold does not trigger repeatedly.
+    #[serde(alias = "threshold")]
+    Hysteresis {
+        upper: f64,
+        lower: f64,
+        trigger: Crossing,
+        #[serde(skip)]
+        band: Option<Band>,
+    },
+    /// Triggers on the first qualifying reading and each new crossing of either boundary.
+    /// The distinct JSON tag preserves the meaning of legacy `type: threshold` nodes.
+    #[serde(rename = "threshold_crossing")]
     Threshold {
         upper: f64,
         lower: f64,
@@ -204,6 +241,8 @@ pub enum Kind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
     #[serde(flatten)]
     pub kind: Kind,
     #[serde(default)]
@@ -222,6 +261,7 @@ impl Node {
         );
         Node {
             name: name.into(),
+            title: String::new(),
             kind,
             position: [0.0, 0.0],
             region: has_region.then(Region::default),
@@ -230,15 +270,79 @@ impl Node {
         }
     }
 
+    /// Copies configuration without carrying over execution state.
+    pub fn duplicate(&self, name: &str) -> Self {
+        let mut node = self.clone();
+        node.name = name.into();
+        match &mut node.kind {
+            Kind::Ocr { last_hash, .. } => *last_hash = None,
+            Kind::Compare { last, .. } => *last = None,
+            Kind::CompareInputs { last, values, .. } => {
+                *last = None;
+                *values = [None, None];
+            }
+            Kind::Hysteresis { band, .. } | Kind::Threshold { band, .. } => *band = None,
+            _ => {}
+        }
+        node
+    }
+
+    pub fn display_title(&self) -> &str {
+        if self.title.trim().is_empty() {
+            &self.name
+        } else {
+            &self.title
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self.kind {
             Kind::Ocr { .. } => "ocr",
             Kind::Model { .. } => "model",
+            Kind::Constant { .. } => "constant",
             Kind::Function { .. } => "function",
             Kind::Compare { .. } => "compare",
+            Kind::CompareInputs { .. } => "compare_inputs",
+            Kind::Hysteresis { .. } => "hysteresis",
             Kind::Threshold { .. } => "threshold",
             Kind::Keyboard { .. } => "keyboard",
             Kind::Click { .. } => "click",
+        }
+    }
+
+    pub(crate) fn reset_input_state(&mut self) {
+        if let Kind::CompareInputs { values, last, .. } = &mut self.kind {
+            *values = [None, None];
+            *last = None;
+        }
+    }
+
+    pub(crate) fn process_slots(
+        &mut self,
+        inputs: &[Option<Value>; 2],
+        backend: &mut dyn Backend,
+    ) -> Result<Option<Value>, String> {
+        if let Kind::CompareInputs { values, .. } = &mut self.kind {
+            for (cached, incoming) in values.iter_mut().zip(inputs) {
+                if let Some(value) = incoming {
+                    *cached = Some(value.clone());
+                }
+            }
+        }
+        self.process(&[], backend)
+    }
+
+    /// Recognizes an already captured event frame without taking another screenshot.
+    pub fn process_frame(
+        &mut self,
+        region: &Region,
+        pixels: &[u8],
+        backend: &mut dyn Backend,
+    ) -> Result<Option<Value>, String> {
+        match &mut self.kind {
+            Kind::Ocr { single_line, last_hash } =>
+                recognize_changed_frame(region, pixels, *single_line, last_hash, backend),
+            _ => Err(format!("Node '{}' is not an OCR event source", self.name)),
         }
     }
 
@@ -249,34 +353,15 @@ impl Node {
         backend: &mut dyn Backend,
     ) -> Result<Option<Value>, String> {
         let region = self.region.unwrap_or_default();
+        let hysteresis = matches!(self.kind, Kind::Hysteresis { .. });
         match &mut self.kind {
             Kind::Ocr { single_line, last_hash } => {
                 let pixels = backend.capture(&region)?;
-                eprintln!(
-                    "[OCR] Region: ({}, {}) {}x{}, Pixels captured: {} bytes",
-                    region.x,
-                    region.y,
-                    region.width,
-                    region.height,
-                    pixels.len()
-                );
-                let mut h = DefaultHasher::new();
-                pixels.hash(&mut h);
-                let hash = h.finish();
-                if *last_hash == Some(hash) {
-                    eprintln!("[OCR] No change detected (hash match)");
-                    return Ok(None);
-                }
-                let result = if *single_line {
-                    backend.ocr_single_line(&region, &pixels)?
-                } else {
-                    backend.ocr(&region, &pixels)?
-                };
-                *last_hash = Some(hash);
-                eprintln!("[OCR] Recognition result: '{}'", result);
-                Ok(Some(Value::Text(result.trim().into())))
+                recognize_changed_frame(&region, &pixels, *single_line, last_hash, backend)
             }
             Kind::Model { format } => Ok(inputs.first().and_then(|v| convert(v, *format))),
+            Kind::Constant { value, format } => convert(&Value::Text(value.clone()), *format)
+                .map(Some).ok_or_else(|| format!("Constant '{}' cannot convert '{}' to {format:?}", self.name, value)),
             Kind::Function { code } => {
                 let engine = Engine::new();
                 let arr: rhai::Array = inputs.iter().map(to_dynamic).collect();
@@ -297,7 +382,7 @@ impl Node {
                     return Ok(None);
                 };
                 let Some(result) = op.test(input, value) else {
-                    eprintln!(
+                    log::warn!(
                         "[COMPARE] Cannot compare '{}' {} '{}'",
                         input.to_text(),
                         op.symbol(),
@@ -307,7 +392,7 @@ impl Node {
                 };
                 let was = last.replace(result);
                 let fire = result && !(*on_change && was == Some(true));
-                eprintln!(
+                log::info!(
                     "[COMPARE] '{}' {} '{}' = {}{}",
                     input.to_text(),
                     op.symbol(),
@@ -317,44 +402,76 @@ impl Node {
                 );
                 Ok(fire.then(|| input.clone()))
             }
-            Kind::Threshold {
+            Kind::CompareInputs { op, trigger_when, on_change, last, values } => {
+                for (cached, incoming) in values.iter_mut().zip(inputs) {
+                    *cached = Some(incoming.clone());
+                }
+                let [Some(left), Some(right)] = values else {
+                    return Ok(None);
+                };
+                let Some(result) = op.test(left, &right.to_text()) else {
+                    log::warn!("[COMPARE INPUTS] Cannot compare '{}' {} '{}'",
+                        left.to_text(), op.symbol(), right.to_text());
+                    return Ok(None);
+                };
+                let previous = last.replace(result);
+                let fire = result == *trigger_when && (!*on_change || previous != Some(result));
+                log::info!("[COMPARE INPUTS] '{}' {} '{}' = {result}{}",
+                    left.to_text(), op.symbol(), right.to_text(), if fire { " -> trigger" } else { "" });
+                Ok(fire.then_some(Value::Bool(result)))
+            }
+            Kind::Hysteresis {
+                upper,
+                lower,
+                trigger,
+                band,
+            } | Kind::Threshold {
                 upper,
                 lower,
                 trigger,
                 band,
             } => {
+                let label = if hysteresis { "HYSTERESIS" } else { "THRESHOLD" };
                 let Some(input) = inputs.first() else {
                     return Ok(None);
                 };
                 if !lower.is_finite() || !upper.is_finite() || lower > upper {
-                    eprintln!("[THRESHOLD] Thresholds must be finite and lower <= upper");
+                    log::warn!("[{label}] Thresholds must be finite and lower <= upper");
                     return Ok(None);
                 }
                 let Some(v) = as_number(input) else {
-                    eprintln!("[THRESHOLD] No number in '{}'", input.to_text());
+                    log::warn!("[{label}] No number in '{}'", input.to_text());
                     return Ok(None);
                 };
                 if !v.is_finite() {
-                    eprintln!("[THRESHOLD] Input must be a finite number");
+                    log::warn!("[{label}] Input must be a finite number");
                     return Ok(None);
                 }
+                if hysteresis && trigger.is_range() {
+                    return Err("Range-entry triggers are only supported by Threshold nodes".into());
+                }
                 let previous = *band;
-                // Between the thresholds the last band is kept; that is the hysteresis.
                 let current = if v > *upper
-                    || (*trigger == Crossing::RisingOrEqual && v == *upper)
+                    || (matches!(*trigger, Crossing::RisingOrEqual | Crossing::EnteringRange) && v == *upper)
                 {
                     Band::Above
                 } else if v < *lower
-                    || (*trigger == Crossing::FallingOrEqual && v == *lower)
+                    || (matches!(*trigger, Crossing::FallingOrEqual | Crossing::EnteringRange) && v == *lower)
                 {
                     Band::Below
-                } else {
+                } else if hysteresis {
                     previous.unwrap_or(Band::Between)
+                } else {
+                    Band::Between
                 };
                 *band = Some(current);
                 let crossed = match (previous, current) {
                     (Some(p), Band::Above) if p != Band::Above => Some(Crossing::Rising),
                     (Some(p), Band::Below) if p != Band::Below => Some(Crossing::Falling),
+                    (None, Band::Above) if !hysteresis => Some(Crossing::Rising),
+                    (None, Band::Below) if !hysteresis => Some(Crossing::Falling),
+                    (Some(p), Band::Between) if p != Band::Between && trigger.is_range() => Some(*trigger),
+                    (None, Band::Between) if !hysteresis && trigger.is_range() => Some(*trigger),
                     _ => None,
                 };
                 let fire = crossed.is_some_and(|c| {
@@ -366,8 +483,8 @@ impl Node {
                                 | (Crossing::FallingOrEqual, Crossing::Falling)
                         )
                 });
-                eprintln!(
-                    "[THRESHOLD] {v} (lower {lower}, upper {upper}) {current:?}{}",
+                log::info!(
+                    "[{label}] {v} (lower {lower}, upper {upper}) {current:?}{}",
                     match (crossed, fire) {
                         (Some(c), true) => format!(" -> {c:?} trigger"),
                         (Some(c), false) => format!(" ({c:?}, ignored)"),
@@ -378,7 +495,7 @@ impl Node {
             }
             Kind::Keyboard { text } => {
                 let Some(v) = inputs.first() else {
-                    eprintln!("[KEYBOARD] No input provided");
+                    log::warn!("[KEYBOARD] No input provided");
                     return Ok(None);
                 };
                 let t = if text.is_empty() {
@@ -388,7 +505,7 @@ impl Node {
                 };
                 let (x, y) = region.center();
                 backend.click(x, y, "left")?;
-                eprintln!(
+                log::info!(
                     "[KEYBOARD] Typing text: '{}' (region: {} x {} at {}, {})",
                     t, region.width, region.height, region.x, region.y
                 );
@@ -397,16 +514,44 @@ impl Node {
             }
             Kind::Click { button } => {
                 if inputs.is_empty() {
-                    eprintln!("[CLICK] No input provided");
+                    log::warn!("[CLICK] No input provided");
                     return Ok(None);
                 }
                 let (x, y) = region.center();
-                eprintln!("[CLICK] Clicking at ({}, {}) with button: {}", x, y, button);
+                log::info!("[CLICK] Clicking at ({}, {}) with button: {}", x, y, button);
                 backend.click(x, y, button)?;
                 Ok(Some(Value::Bool(true)))
             }
         }
     }
+}
+
+fn recognize_changed_frame(
+    region: &Region,
+    pixels: &[u8],
+    single_line: bool,
+    last_hash: &mut Option<u64>,
+    backend: &mut dyn Backend,
+) -> Result<Option<Value>, String> {
+    log::info!(
+        "[OCR] Region: ({}, {}) {}x{}, Pixels captured: {} bytes",
+        region.x, region.y, region.width, region.height, pixels.len()
+    );
+    let mut h = DefaultHasher::new();
+    pixels.hash(&mut h);
+    let hash = h.finish();
+    if *last_hash == Some(hash) {
+        log::info!("[OCR] No change detected (hash match)");
+        return Ok(None);
+    }
+    let result = if single_line {
+        backend.ocr_single_line(region, pixels)?
+    } else {
+        backend.ocr(region, pixels)?
+    };
+    *last_hash = Some(hash);
+    log::info!("[OCR] Recognition result: '{}'", result);
+    Ok(Some(Value::Text(result.trim().into())))
 }
 
 /// Extracts the first number from text such as OCR output.

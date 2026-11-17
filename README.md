@@ -15,7 +15,7 @@ The project has two parts:
 - Convert text and other values to text, number, integer, or boolean values.
 - Evaluate a Rhai expression or script to make decisions and transform values.
 - Click the center of a configured screen region, or click and type text there.
-- Run connected nodes in dependency order on a repeating timer.
+- Run connected nodes in dependency order on a timer, with display refresh, or from native screen-change events on Windows.
 - Save and load the graph, including node settings, connections, and screen regions, as JSON.
 - Test workflow behavior using a fake backend without requiring a monitor or real input devices.
 
@@ -55,13 +55,31 @@ The model paths used are logged as `[OCR] Models: ...`. To run fully offline, pl
 1. Start the GUI with `cargo run --release --features gui`. An unoptimized debug build can make OCR substantially slower.
 2. Click the floating plus icon at the top right of the canvas and choose a node type. The node appears on the canvas with a generated name.
 3. Drag nodes to arrange the workflow. Drag from an output pin to an input pin to create an edge; use the graph editor's pin controls to remove or reroute connections. Use the canvas zoom and pan controls to navigate larger workflows.
-4. Click a node to open its floating settings window. To delete a node and its connections, drag it onto the trash icon at the bottom right of the canvas, click the icon while a node is selected, or use **Delete node** in its settings. For OCR, keyboard, and click nodes, position and resize the on-screen region window. Drag inside the window to move it; drag its lower-right grip to resize it. The region is used both for screen capture and as the target location for actions. While running, the region interior is transparent, its label and outline are outside the region, and mouse input passes through; press **Stop** to move or resize it. Avoid placing another overlay's label or outline over an OCR region.
-5. Enter a refresh delay in milliseconds (100–60,000; default 3,000), then press **Run**. Invalid input leaves the last valid delay in effect. Press **Stop** or the **Esc** key to stop execution. On Windows, **Esc** stops the workflow even when another application has focus; on other platforms the ScreenAutomation window must be focused. A run already in progress finishes before the workflow stops.
-6. Enter a file path in the save/load field and use **Save** or **Load** to persist or restore the graph. The default path is `graph.json`.
+4. Single-click a node to select it; double-click to open its floating settings window. To delete a node and its connections, drag it onto the trash icon at the bottom right of the canvas, click the icon while a node is selected, or use **Delete node** in its settings. For OCR, keyboard, and click nodes, position and resize the on-screen region window. Drag inside the window to move it; drag its lower-right grip to resize it. The region is used both for screen capture and as the target location for actions. While running, the region interior is transparent, its label and outline are outside the region, and mouse input passes through; press **Stop** to move or resize it. Avoid placing another overlay's label or outline over an OCR region.
+5. Open **Settings → Run timing...** to choose **Timed delay** (100–60,000 ms; default 1,000), **Display refresh**, or **HMI Event (screen change)** (Windows only), then press the menu bar's green play **Run** button. Invalid delay input leaves the last valid delay in effect. Press the red-square **Stop** button or the **Esc** key to stop execution. On Windows, **Esc** stops the workflow even when another application has focus; on other platforms the ScreenAutomation window must be focused. A run already in progress finishes before the workflow stops.
+6. Use the **File** menu to create a **New** graph, **Load graph JSON...**, **Save**, **Save As...**, or **Exit**. New starts an empty, untitled graph with default timing settings. Before New, Load, Exit, or closing the application window, unsaved changes prompt you to **Save**, **Discard**, or **Cancel**. Save must succeed before continuing; canceling Save As or a save error keeps the current graph open. Load and Save As open native file dialogs. Save writes to the last successfully loaded or saved file; for a new graph it opens Save As, suggesting `graph.json`. Opening a file dialog or an unsaved-changes prompt stops automation (even if canceled), and loading leaves the workflow stopped so you can review it before running.
 
 Region-bearing nodes start with a region at screen position `(100, 100)` and size `300 × 120` UI points. Overlay coordinates are converted to physical screen pixels for capture and input, including on scaled displays. Keep each OCR region entirely within one monitor. Their overlay color and opacity can be adjusted in the selected node's settings. Opacity applies to the fill, outline, label, and resize grip; the fill and grip are hidden while running.
 
-Node positions are saved with the workflow. Existing workflow files that do not contain positions are laid out automatically when loaded.
+The window title shows the current filename (or **Untitled** for a new graph), with an **\*** when there are unsaved changes. Changes to nodes, connections, positions, screen regions, appearance, and run timing count as edits; execution state and logs do not. The bottom bar shows the latest session log by default; hover over it for the full text, file path, and last run duration. Click **^** at the bottom right to expand a resizable, terminal-style log panel, and **v** to collapse it. The expanded view supports vertical/horizontal scrolling, selectable text, **Copy logs**, and automatic following of new entries unless you scroll up. Execution timings and debug-build information appear above the log.
+
+Logs include OCR results, comparisons, threshold decisions, clicks, keyboard actions, run/stop events, file operations, and errors. Timestamps show elapsed time since the app started; multiline OCR text uses visible `\n`/`\r` escapes. Logs stay in memory across stops and workflow loads until the app exits; they are not saved in the graph JSON or automatically written to disk. The newest 5,000 entries are kept to bound memory, with a discarded-entry count shown when older entries are removed. Copy logs before exiting if you need to keep them. The same application messages still appear in the terminal.
+
+**Timed delay** measures the interval between the starts of workflow checks; slow capture/OCR does not add another full delay. **Display refresh** checks once per rendered application frame, paced by VSync on the app window's display, rather than a fixed timer. It is not a notification of changes in another application: capture/OCR can reduce the achieved rate, and minimizing the app may pause checks. Both modes capture monitored regions and run OCR only when the captured pixels change, as before. Other source nodes, such as Constant, still run on every workflow check.
+
+**HMI Event (screen change)** waits for native Windows Desktop Duplication frame notifications instead of taking screenshots on a timer. It compares pixels only in monitored OCR regions; the initial snapshot and subsequent changed regions trigger OCR and their connected branches. Unrelated action branches do not run. Shared descendants execute once per batch, using the latest values from other inputs; constants and their transformations supply context without independently triggering actions. Only the latest pending pixels per region are retained if OCR cannot keep up. There must be at least one OCR node, each region must fit on one unrotated monitor, and the display/driver must support Desktop Duplication. Capture failures (including a lost display/session) stop automation with an error; there is no silent polling fallback. Capture workers are stopped and joined on Stop/Exit. Mode changes into or out of HMI Event, or edits to node configuration, connections, or monitored regions, stop the current run. Review the workflow before pressing Run again; restarting processes fresh snapshots.
+
+The event value-routing mechanism is independent of screen capture, but **sound and network event sources are not implemented yet**. Event capture does not repair OCR mistakes, and GUI scheduling or slow OCR may delay execution even when frame notifications arrive promptly.
+
+Node positions, the run mode, and the refresh delay are saved with the workflow. Settings are stored as `settings.run_mode` (`timed`, `display_refresh`, or `hmi_event`) and `settings.refresh_ms` and restored when loading. Older files without a run mode use timed execution; those without a delay use 1,000 ms. Invalid saved settings are reported as load errors without replacing the current graph. Existing workflow files that do not contain positions are laid out automatically when loaded.
+
+Click outside the floating node settings window to dismiss it. Single-clicking its selected node keeps it open; single-clicking another node closes it and selects that node. Double-click a node to open its settings. Controls and dropdowns inside the settings remain interactive.
+
+Edit **Title** in node settings to change the title on the canvas and any region overlay. Titles are saved with the graph; clearing the field restores the generated name. Changing a title does not affect connections or the node's internal name.
+
+Clickable controls show a hand cursor on hover. Text-entry, drag, and resize controls retain their specialized cursors; disabled controls do not show a hand.
+
+Hold **Shift** when starting to drag a node to duplicate it. The original stays in place while the new, selected copy follows the pointer, even if you release Shift before dropping it. The copy keeps the title, settings, and screen region, but gets a unique internal name, no connections, and fresh execution state. Shift-click alone does not create a copy.
 
 ## Node types
 
@@ -69,13 +87,20 @@ Node positions are saved with the workflow. Existing workflow files that do not 
 | --- | --- | --- |
 | `ocr` | Captures its region and runs OCR only when the captured pixel bytes differ from the previous capture. Enable **Single line (prices / numbers)** for a single price: it trims plain background margins, normalizes dark backgrounds, and bypasses word/line detection so fragments stay in left-to-right order and decimal points remain inside the recognition crop. Fit the region around the entire number with a small plain-background margin and exclude other text/icons. Multiline detection remains the default. | Recognized text, trimmed. No output when the pixels are unchanged. |
 | `model` | Uses the first input and converts it to the selected `text`, `number`, `int`, or `bool` format. For `number` and `int`, line breaks, spaces, and symbols are removed and words such as `BTC` are skipped, so OCR text like `$ 64,777\n.49` becomes `64777.49`. Thousands separators are removed, and decimals are kept for `number`. | The converted value, or no output if no number is found. |
+| `constant` | A source node with no inputs. Enter a fixed value and choose Text, Number, Integer, or Boolean. Outputs on every workflow tick; invalid numeric values report an error. | The configured, typed value. |
 | `function` | Evaluates Rhai code with an `inputs` array in scope. The last expression is the result. | A boolean, integer, number, or text value. Rhai's unit value `()` produces no output. |
 | `compare` | Compares the first input with its configured value using `>`, `≥`, `=`, `≠`, `≤`, or `<`. A number is extracted from text input, such as OCR output like `BTC 64777.49`. If the input or configured value is not numeric, only `=` and `≠` apply, using trimmed text. With **Only trigger when the condition becomes true** enabled, which is the default, it fires once each time the condition changes from false to true. | The unchanged input when it triggers. Otherwise, no output, so downstream nodes such as `click` do not run. |
-| `threshold` | Hysteresis trigger with an upper and a lower threshold. Choose **Rises above upper** (`>`), **Rises to or above upper** (`>=`), **Falls below lower** (`<`), **Falls to or below lower** (`<=`), or both strict crossings. The inclusive choices also trigger at equality. After a rise, the value must fall strictly below the lower threshold to re-arm; after a fall, it must rise strictly above the upper threshold to re-arm. Repeated equal readings do not retrigger. The first reading never fires. Numbers are extracted from text in the same way as `compare`. | The unchanged input when it triggers. Otherwise, no output. |
+| `compare_inputs` (menu: **compare inputs**) | Compares two connected values: **A** is the top input and **B** the bottom. Choose `>`, `≥`, `=`, `≠`, `≤`, or `<`, then select **True** or **False** as the trigger state. Numeric/OCR text uses the same comparison rules as `compare`; nonnumeric text supports equality/inequality. Waits until both inputs have supplied a value, then compares their latest values whenever either updates. With **Only trigger when the result changes** enabled (default), it fires once when the selected state is first reached, then waits for a different result before firing again. Disconnecting, reconnecting, or deleting a source clears cached inputs. | The boolean result (`true` or `false`) when it matches the selected trigger state; otherwise no output. Either boolean can trigger a connected Click node. |
+| `hysteresis` | The former threshold node. Choose `> upper`, `>= upper`, `< lower`, `<= lower`, or both strict crossings. After a rise, the value must fall strictly below the lower threshold to re-arm; after a fall, it must rise strictly above the upper threshold. Values between thresholds keep the last state. The first reading never fires. Numbers are extracted from text in the same way as `compare`. | The unchanged input when it triggers. Otherwise, no output. |
+| `threshold` | Choose `> upper`, `>= upper`, `< lower`, `<= lower`, both strict crossings, or **Enters range** with strict (`lower < value < upper`) or inclusive (`lower <= value <= upper`) boundaries. The first reading fires if the selected condition holds. Range entry fires once, then requires leaving and re-entering the range; strict mode treats either boundary as outside. Equal bounds define an empty strict range or a single-value inclusive range. Other crossing modes re-arm on returning to the non-triggering side of the same boundary or reaching the other threshold. For example, with `> 100`, `101 → 99 → 101` fires on both readings of `101` without needing to cross the lower threshold. Numbers are extracted as for `compare`. | The unchanged input when it triggers. Otherwise, no output. |
 | `keyboard` | Requires an input. Clicks the center of its region, then types its configured text; if that setting is empty, it types the first input converted to text. | The text it typed. |
 | `click` | Requires at least one input. Clicks the center of its region using the configured mouse button (`left`, `right`, or `middle`; unknown values fall back to `left`). | `true` after the click. |
 
-`model`, `function`, `compare`, and `threshold` nodes do not have screen regions. OCR, keyboard, and click nodes do.
+`model`, `constant`, `function`, `compare`, `compare_inputs`, `hysteresis`, and `threshold` nodes do not have screen regions. OCR, keyboard, and click nodes do.
+
+Each Compare Inputs port accepts one connection. Input assignments and constants are saved in the graph JSON; cached runtime values are not. Existing `[source, target]` edges still load as input A (port 0). Edges to input B use `{"source":"node1","target":"compare_inputs3","input":1}`.
+
+Older JSON nodes tagged `"type": "threshold"` still load as **hysteresis**, preserving their behavior, names, and connections. They save with `"type": "hysteresis"`. New **threshold** nodes use `"type": "threshold_crossing"` in JSON to distinguish them from the legacy format.
 
 OCR can still misread a decimal point. Number conversion cannot recover a dot that OCR omitted and does not guess decimal placement. Check recognized text before connecting live actions.
 
@@ -84,6 +109,16 @@ Nodes are drawn as compact blocks, colored by type, with an icon strip, the node
 When a node produces output during a run, its outgoing wires and pins turn green and fade over about one second. The last output is shown under the node with a status dot. A wire that stays grey did not carry data in that run, for example because OCR saw no change or a compare condition was false.
 
 ### Example workflow
+
+To compare a live OCR value against a constant (or another OCR source), connect them to separate inputs:
+
+```text
+ocr --------------------> A
+                          compare inputs (A > B, trigger True) -> click
+constant (Number: 100) --> B
+```
+
+Select **False** instead to click when the comparison is false. Unlike the original Compare node, this node outputs the boolean result, not the incoming text.
 
 To click a button when a price rises above a threshold:
 
@@ -97,6 +132,8 @@ To click Button 1 when a price rises above an upper threshold and Button 2 when 
 ocr → model (number) → threshold (rises above upper) → click (Button 1)
                     └→ threshold (falls below lower) → click (Button 2)
 ```
+
+Use `hysteresis` instead if each direction should stay disarmed until the opposite threshold is crossed, and the first reading should never trigger.
 
 A useful pattern is:
 
@@ -121,7 +158,7 @@ With an OCR node upstream, the function receives the numeric value produced by t
 - A function returning `()` and an OCR node whose pixels have not changed both produce no value. This is how a branch can stop and how unchanged screen content avoids repeating downstream actions.
 - Cycles are rejected when executing a graph. Connect nodes to form a directed acyclic graph (DAG).
 - Each node can return an error, for example if screen capture, OCR, script evaluation, or simulated input fails. The GUI displays the error in its status area.
-- The refresh interval is adjustable from 100 ms to 60,000 ms; the initial interval is 3,000 ms. It is a target time between run starts, not a guarantee: screen capture, OCR, actions, and rendering may take longer. The toolbar shows the last run duration and observed interval. Runs do not overlap or accumulate; when one takes longer than the target, the next starts as soon as possible. For the best OCR speed use the release build.
+- The refresh interval is adjustable from 100 ms to 60,000 ms; the initial interval is 1,000 ms. It is a target time between run starts, not a guarantee: screen capture, OCR, actions, and rendering may take longer. The status bar shows the last run duration and observed interval. Runs do not overlap or accumulate; when one takes longer than the target, the next starts as soon as possible. For the best OCR speed use the release build.
 
 ## Saving and loading
 
@@ -162,6 +199,7 @@ src/
   desktop.rs   Optional real desktop capture, OCRS engine, and input backend
   graph.rs     Graph operations, ordering, persistence, and execution
   lib.rs       Library module exports
+  session_log.rs Bounded session log capture for the GUI and terminal
   main.rs      Optional eframe application and egui-snarl graph editor
   node.rs      Node kinds, values, conversions, and processing
 tests/

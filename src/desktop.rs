@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 
 pub struct Desktop {
     enigo: Enigo,
-    width: u32,
-    height: u32,
     ocr: Option<OcrEngine>,
 }
 
@@ -18,8 +16,6 @@ impl Desktop {
     pub fn new() -> Result<Desktop, String> {
         Ok(Desktop {
             enigo: Enigo::new(&Settings::default()).map_err(|e| e.to_string())?,
-            width: 0,
-            height: 0,
             ocr: None,
         })
     }
@@ -104,7 +100,7 @@ fn local_or_cached_model(filename: &str) -> Result<PathBuf, String> {
 fn load_ocr_engine() -> Result<OcrEngine, String> {
     let detection_path = local_or_cached_model("text-detection.onnx")?;
     let recognition_path = local_or_cached_model("text-recognition.onnx")?;
-    eprintln!(
+    log::info!(
         "[OCR] Models: {} and {}",
         detection_path.display(),
         recognition_path.display()
@@ -229,17 +225,15 @@ impl Backend for Desktop {
             mon.y().map_err(|e| e.to_string())?,
             r,
         )?;
-        self.width = r.width;
-        self.height = r.height;
         Ok(out)
     }
 
-    fn ocr(&mut self, _: &Region, pixels: &[u8]) -> Result<String, String> {
-        if self.width == 0 || self.height == 0 {
-            return Err("No screen region has been captured for OCR".into());
+    fn ocr(&mut self, region: &Region, pixels: &[u8]) -> Result<String, String> {
+        if region.width == 0 || region.height == 0 {
+            return Err("OCR requires a non-empty screen region".into());
         }
 
-        let image = ImageSource::from_bytes(pixels, (self.width, self.height))
+        let image = ImageSource::from_bytes(pixels, (region.width, region.height))
             .map_err(|e| e.to_string())?;
         let engine = self.ocr_engine()?;
         let input = engine.prepare_input(image).map_err(|e| e.to_string())?;
