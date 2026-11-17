@@ -17,12 +17,17 @@ The project has two parts:
 - Click the center of a configured screen region, or click and type text there.
 - Run connected nodes in dependency order on a timer, with display refresh, or from native screen-change events on Windows.
 - Save and load the graph, including node settings, connections, and screen regions, as JSON.
+- Undo/redo edits, search and focus nodes, fit the graph, and organize nodes with groups and sticky notes.
+- Preview workflows without real clicks or typing, inspect execution one step at a time, and validate graphs before running.
+- Filter suspicious OCR/numeric readings and reuse embedded subflows.
+- Trigger branches from global hotkeys, microphone levels, local HTTP webhooks, text-file changes, or timers.
+- Keep separate crash-recovery copies and a recent-file list.
 - Test workflow behavior using a fake backend without requiring a monitor or real input devices.
 
 ## Requirements
 
 - Rust and Cargo (Rust 1.92 or newer; the package uses Rust edition 2021).
-- The native system libraries required by `eframe`, `xcap`, and `enigo` on your operating system. On Linux, desktop builds may require X11-related libraries and input/display access.
+- The native system libraries required by `eframe`, `xcap`, `enigo`, and `cpal` on your operating system. On Linux, desktop builds may require X11-related libraries, ALSA development libraries for microphone input, and input/display access.
 - The OCR models `text-detection.onnx` and `text-recognition.onnx`. They are loaded from a local `models/` folder when present; otherwise internet access is needed the first time OCR is used so they can be downloaded into the operating system's application cache.
 
 The GUI and real desktop integrations are behind the `gui` Cargo feature. The default build has no desktop backend dependencies enabled. The desktop editor uses eframe for native windows and `egui-snarl` for its interactive graph canvas.
@@ -56,10 +61,10 @@ The model paths used are logged as `[OCR] Models: ...`. To run fully offline, pl
 2. Click the floating plus icon at the top right of the canvas and choose a node type. The node appears on the canvas with a generated name.
 3. Drag nodes to arrange the workflow. Drag from an output pin to an input pin to create an edge; use the graph editor's pin controls to remove or reroute connections. Use the canvas zoom and pan controls to navigate larger workflows.
 4. Single-click a node to select it; double-click to open its floating settings window. To delete a node and its connections, drag it onto the trash icon at the bottom right of the canvas, click the icon while a node is selected, or use **Delete node** in its settings. For OCR, keyboard, and click nodes, position and resize the on-screen region window. Drag inside the window to move it; drag its lower-right grip to resize it. The region is used both for screen capture and as the target location for actions. While running, the region interior is transparent, its label and outline are outside the region, and mouse input passes through; press **Stop** to move or resize it. Avoid placing another overlay's label or outline over an OCR region.
-5. Open **Settings → Run timing...** to choose **Timed delay** (100–60,000 ms; default 1,000), **Display refresh**, or **HMI Event (screen change)** (Windows only), then press the menu bar's green play **Run** button. Invalid delay input leaves the last valid delay in effect. Press the red-square **Stop** button or the **Esc** key to stop execution. On Windows, **Esc** stops the workflow even when another application has focus; on other platforms the ScreenAutomation window must be focused. A run already in progress finishes before the workflow stops.
+5. Open **Settings → Run timing...** to choose **Timed delay** (100–60,000 ms; default 1,000), **Display refresh**, or **HMI Event**, then press the menu bar's green play **Run** button. Screen-change sources require Windows; configured Event nodes also work in HMI Event mode. Invalid delay input leaves the last valid delay in effect. Press the red-square **Stop** button or the **Esc** key to stop execution. On Windows, **Esc** stops the workflow even when another application has focus; on other platforms the ScreenAutomation window must be focused. A run already in progress finishes before the workflow stops.
 6. Use the **File** menu to create a **New** graph, **Load graph JSON...**, **Save**, **Save As...**, or **Exit**. New starts an empty, untitled graph with default timing settings. Before New, Load, Exit, or closing the application window, unsaved changes prompt you to **Save**, **Discard**, or **Cancel**. Save must succeed before continuing; canceling Save As or a save error keeps the current graph open. Load and Save As open native file dialogs. Save writes to the last successfully loaded or saved file; for a new graph it opens Save As, suggesting `graph.json`. Opening a file dialog or an unsaved-changes prompt stops automation (even if canceled), and loading leaves the workflow stopped so you can review it before running.
 
-Region-bearing nodes start with a region at screen position `(100, 100)` and size `300 × 120` UI points. Overlay coordinates are converted to physical screen pixels for capture and input, including on scaled displays. Keep each OCR region entirely within one monitor. Their overlay color and opacity can be adjusted in the selected node's settings. Opacity applies to the fill, outline, label, and resize grip; the fill and grip are hidden while running.
+Region-bearing nodes start with a region at screen position `(100, 100)` and size `300 × 120` UI points. The capture area can be resized down to `80 × 1` UI points, allowing thin, single-line regions; the marker window also reserves space for its title and margins outside that area. Overlay coordinates are converted to physical screen pixels for capture and input, including on scaled displays. Keep each OCR region entirely within one monitor. Their overlay color and opacity can be adjusted in the selected node's settings. Opacity applies to the fill, outline, label, and resize grip; the fill and grip are hidden while running.
 
 The window title shows the current filename (or **Untitled** for a new graph), with an **\*** when there are unsaved changes. Changes to nodes, connections, positions, screen regions, appearance, and run timing count as edits; execution state and logs do not. The bottom bar shows the latest session log by default; hover over it for the full text, file path, and last run duration. Click **^** at the bottom right to expand a resizable, terminal-style log panel, and **v** to collapse it. The expanded view supports vertical/horizontal scrolling, selectable text, **Copy logs**, and automatic following of new entries unless you scroll up. Execution timings and debug-build information appear above the log.
 
@@ -67,9 +72,50 @@ Logs include OCR results, comparisons, threshold decisions, clicks, keyboard act
 
 **Timed delay** measures the interval between the starts of workflow checks; slow capture/OCR does not add another full delay. **Display refresh** checks once per rendered application frame, paced by VSync on the app window's display, rather than a fixed timer. It is not a notification of changes in another application: capture/OCR can reduce the achieved rate, and minimizing the app may pause checks. Both modes capture monitored regions and run OCR only when the captured pixels change, as before. Other source nodes, such as Constant, still run on every workflow check.
 
-**HMI Event (screen change)** waits for native Windows Desktop Duplication frame notifications instead of taking screenshots on a timer. It compares pixels only in monitored OCR regions; the initial snapshot and subsequent changed regions trigger OCR and their connected branches. Unrelated action branches do not run. Shared descendants execute once per batch, using the latest values from other inputs; constants and their transformations supply context without independently triggering actions. Only the latest pending pixels per region are retained if OCR cannot keep up. There must be at least one OCR node, each region must fit on one unrotated monitor, and the display/driver must support Desktop Duplication. Capture failures (including a lost display/session) stop automation with an error; there is no silent polling fallback. Capture workers are stopped and joined on Stop/Exit. Mode changes into or out of HMI Event, or edits to node configuration, connections, or monitored regions, stop the current run. Review the workflow before pressing Run again; restarting processes fresh snapshots.
+**HMI Event** uses native Windows Desktop Duplication frame notifications for top-level OCR sources instead of taking screenshots on a timer. It compares pixels only in monitored OCR regions; the initial snapshot and subsequent changed regions trigger OCR and their connected branches. Unrelated action branches do not run. Shared descendants execute once per batch, using the latest values from other inputs; constants and their transformations supply context without independently triggering actions. Only the latest pending pixels per region are retained if OCR cannot keep up. There must be at least one top-level OCR or Event node. Each screen region must fit on one unrotated monitor, and the display/driver must support Desktop Duplication. Capture failures (including a lost display/session) stop automation with an error; there is no silent screenshot-polling fallback. Capture workers are stopped and joined on Stop/Exit. Mode changes into or out of HMI Event, or edits to node configuration, connections, or monitored regions, stop the current run. Review the workflow before pressing Run again; restarting processes fresh screen snapshots and restarts external producers.
 
-The event value-routing mechanism is independent of screen capture, but **sound and network event sources are not implemented yet**. Event capture does not repair OCR mistakes, and GUI scheduling or slow OCR may delay execution even when frame notifications arrive promptly.
+Add an **event** node and choose its producer in node settings, then select **HMI Event** in Run timing. Event capture does not repair OCR mistakes, and GUI scheduling or slow OCR may delay execution even when notifications arrive promptly.
+
+| Event source | Configuration and output |
+| --- | --- |
+| Global hotkey | Windows only. Examples: `F8`, `Ctrl+Alt+K`. Emits `true` once per press, not repeatedly while held. Escape is reserved for Stop. Avoid application shortcuts such as F5–F7 while the editor is focused. |
+| Microphone level | Uses the default input device only while the live workflow is running. Emits RMS on reaching or crossing above the configured threshold; dropping below it re-arms detection. Device/permission errors stop the workflow with an error. |
+| HTTP webhook | Accepts UTF-8 `POST` bodies at the configured path on `127.0.0.1`; emits the body as text. Maximum body size: 64 KiB. Use a distinct port per webhook. It is not exposed to the LAN or internet and has no authentication; other local processes can trigger it while running. |
+| File change | Checks an existing UTF-8 text file every 100 ms and emits its new contents when they change. Files are limited to 1 MiB. Initial contents establish the baseline and do not trigger. Read failures stop the workflow explicitly. |
+| Timer | Emits increasing integer ticks at the configured interval (minimum 100 ms). This is an additional event source, not a cooldown on actions. |
+
+Only the latest pending value per source is retained. Stop closes listeners, stops microphone capture, and joins workers. An in-flight webhook can delay shutdown by roughly four seconds (bounded request-read/write waits); audio-driver teardown and OS I/O can also delay it. External Event nodes must be in the top-level graph, not embedded subflows. Native screen-change monitoring also applies to top-level OCR sources; OCR inside a subflow runs when that subflow is invoked, for example by a connected Timer event.
+
+### Editing, validation, and safe testing
+
+- **Edit → Undo / Redo** restores graph edits, including deletion and connections. Dragging or editing one field is grouped as one edit; up to 100 edit groups are retained. New/load starts a new edit history. Undoing back to the saved graph clears the unsaved marker.
+- **Edit → Find node...** searches title, internal name, type, and group, selects the result, opens settings, and focuses the canvas on that node. **Fit graph** frames every node without changing saved positions.
+- Assign the same **Group** name in node settings to draw a named section around those nodes. **note** nodes display editable sticky-note text and have no pins.
+- **Tools → Validate graph** lists configuration/connection problems and lets you select affected nodes; invalid nodes have red outlines. Live Run performs validation first. This checks graph structure, required inputs, thresholds, numeric guard configuration, regions, event configuration, and subflows; device availability is checked when the device is actually opened.
+- **Tools → Dry Run** executes one fresh snapshot without sending clicks or typing to the real backend. **Step** advances one top-level node at a time. The preview window shows inputs, outputs, and actions that would occur. Capture/OCR remains real; external event listeners are not started. A subflow is one outer step, including its recorded inner actions. Editing invalidates the preview session; live Run remains a separate, explicitly real execution path.
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+N / Ctrl+O / Ctrl+S | New / Open / Save |
+| Ctrl+Shift+S | Save As |
+| Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z | Undo / Redo / Redo (outside text fields, which retain normal text editing) |
+| Ctrl+F / Ctrl+0 | Find node / Fit graph |
+| Delete | Delete selected node (outside text fields) |
+| F5 / F6 / F7 | Live Run/Stop / Dry Run / Step |
+
+On macOS, use Command instead of Ctrl. Inside an embedded editor, use **Back to parent graph** to access file operations.
+
+### Recovery and recent files
+
+Unsaved work is copied approximately every two seconds to a **separate recovery file** in the operating system's local application-data directory. It never silently overwrites your manually saved graph. After an interrupted session, choose **Recover** or **Discard recovery** at startup. Recovered changes remain unsaved until you explicitly save them. Saving or deliberately discarding changes clears the recovery copy. The last ten successfully opened/saved paths appear under **File → Recent files**, with the same unsaved-changes guard as Open.
+
+Recovery and recent-file storage is locked to one application instance at a time. Another instance can still edit graphs but reports that persistence is unavailable rather than overwriting the first instance's recovery. Storage errors are shown in the status/logs.
+
+### Embedded reusable subflows
+
+Add a **subflow** node, open its settings, and select **Edit embedded workflow**. The canvas switches to its internal graph; **Back to parent graph** returns to the containing workflow. Changes are included in the parent's JSON, not linked to another file. Shift-drag the subflow node to reuse a copy with fresh runtime state. **Import workflow JSON...** embeds a copy of an existing graph.
+
+Use **subflow input** to receive the containing node's value and exactly one **subflow output** to return a value. An external input connection is required only if the internal input is actually connected. Source-only subflows can run without an incoming value. Add the output node before importing a workflow not originally built as a subflow. Embedded run settings do not schedule separate loops: the parent invokes the subflow. Nested subflows are supported up to 16 levels; external Event nodes belong in the top-level graph. Region overlays and physical-pixel conversion also cover nested nodes.
 
 Node positions, the run mode, and the refresh delay are saved with the workflow. Settings are stored as `settings.run_mode` (`timed`, `display_refresh`, or `hmi_event`) and `settings.refresh_ms` and restored when loading. Older files without a run mode use timed execution; those without a delay use 1,000 ms. Invalid saved settings are reported as load errors without replacing the current graph. Existing workflow files that do not contain positions are laid out automatically when loaded.
 
@@ -95,6 +141,11 @@ Hold **Shift** when starting to drag a node to duplicate it. The original stays 
 | `threshold` | Choose `> upper`, `>= upper`, `< lower`, `<= lower`, both strict crossings, or **Enters range** with strict (`lower < value < upper`) or inclusive (`lower <= value <= upper`) boundaries. The first reading fires if the selected condition holds. Range entry fires once, then requires leaving and re-entering the range; strict mode treats either boundary as outside. Equal bounds define an empty strict range or a single-value inclusive range. Other crossing modes re-arm on returning to the non-triggering side of the same boundary or reaching the other threshold. For example, with `> 100`, `101 → 99 → 101` fires on both readings of `101` without needing to cross the lower threshold. Numbers are extracted as for `compare`. | The unchanged input when it triggers. Otherwise, no output. |
 | `keyboard` | Requires an input. Clicks the center of its region, then types its configured text; if that setting is empty, it types the first input converted to text. | The text it typed. |
 | `click` | Requires at least one input. Clicks the center of its region using the configured mouse button (`left`, `right`, or `middle`; unknown values fall back to `left`). | `true` after the click. |
+| `validate_number` | Rejects unreadable/non-finite numbers, readings outside optional minimum/maximum bounds, changes larger than an optional absolute limit from the last accepted reading, or text not matching an optional regular expression. Use `^` and `$` to require a whole-value match, e.g. `^[0-9]+\.[0-9]{2}$`. Rejections are logged, never update the accepted baseline, and do not guess missing decimal points. | Original input if accepted; otherwise no output. |
+| `event` | One of the configured hotkey, microphone, webhook, file, or timer producers. Active only in HMI Event mode. | Producer's value, routed to connected branches. |
+| `note` | Editable annotation with optional group; no execution or pins. | No output. |
+| `subflow` | Executes a self-contained embedded graph, using its input/output nodes. | Value returned by the internal Subflow Output, or no output. |
+| `subflow_input` / `subflow_output` | Boundary nodes inside an embedded workflow. | Receive the caller's value / return the internal result. |
 
 `model`, `constant`, `function`, `compare`, `compare_inputs`, `hysteresis`, and `threshold` nodes do not have screen regions. OCR, keyboard, and click nodes do.
 

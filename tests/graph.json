@@ -46,8 +46,8 @@
         93.99999
       ],
       "region": {
-        "x": 765,
-        "y": 608,
+        "x": 764,
+        "y": 583,
         "width": 158,
         "height": 60
       },
@@ -67,8 +67,8 @@
         181.2
       ],
       "region": {
-        "x": 764,
-        "y": 700,
+        "x": 760,
+        "y": 677,
         "width": 158,
         "height": 60
       },
@@ -82,8 +82,8 @@
     {
       "name": "threshold5",
       "type": "threshold_crossing",
-      "upper": 1802.0106,
-      "lower": 1800.2095,
+      "upper": 100.014,
+      "lower": 99.914,
       "trigger": "rising",
       "position": [
         264.0,
@@ -100,8 +100,8 @@
     {
       "name": "threshold6",
       "type": "threshold_crossing",
-      "upper": 1802.0106,
-      "lower": 1800.2095,
+      "upper": 100.014,
+      "lower": 99.914,
       "trigger": "falling",
       "position": [
         260.8,

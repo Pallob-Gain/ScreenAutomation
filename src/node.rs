@@ -1,4 +1,5 @@
 use crate::backend::{Backend, Region};
+use crate::graph::Graph;
 use rhai::{Dynamic, Engine, Scope};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -236,6 +237,29 @@ pub enum Kind {
     Click {
         button: String,
     },
+    #[serde(rename = "validate_number")]
+    ValidateNumber {
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+        max_change: Option<f64>,
+        #[serde(default)]
+        pattern: String,
+        #[serde(skip)]
+        last: Option<f64>,
+    },
+    Event {
+        event: crate::event_sources::EventSource,
+    },
+    Note {
+        text: String,
+    },
+    Subflow {
+        graph: Box<Graph>,
+    },
+    #[serde(rename = "subflow_input")]
+    SubflowInput,
+    #[serde(rename = "subflow_output")]
+    SubflowOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -243,6 +267,8 @@ pub struct Node {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     #[serde(flatten)]
     pub kind: Kind,
     #[serde(default)]
@@ -262,6 +288,7 @@ impl Node {
         Node {
             name: name.into(),
             title: String::new(),
+            group: String::new(),
             kind,
             position: [0.0, 0.0],
             region: has_region.then(Region::default),
@@ -274,7 +301,12 @@ impl Node {
     pub fn duplicate(&self, name: &str) -> Self {
         let mut node = self.clone();
         node.name = name.into();
-        match &mut node.kind {
+        node.reset_runtime();
+        node
+    }
+
+    pub(crate) fn reset_runtime(&mut self) {
+        match &mut self.kind {
             Kind::Ocr { last_hash, .. } => *last_hash = None,
             Kind::Compare { last, .. } => *last = None,
             Kind::CompareInputs { last, values, .. } => {
@@ -282,9 +314,26 @@ impl Node {
                 *values = [None, None];
             }
             Kind::Hysteresis { band, .. } | Kind::Threshold { band, .. } => *band = None,
+            Kind::ValidateNumber { last, .. } => *last = None,
+            Kind::Subflow { graph } => graph.reset_runtime(),
             _ => {}
         }
-        node
+    }
+
+    pub fn input_count(&self) -> usize {
+        match self.kind {
+            Kind::Ocr { .. } | Kind::Constant { .. } | Kind::Event { .. }
+            | Kind::Note { .. } | Kind::SubflowInput => 0,
+            Kind::CompareInputs { .. } => 2,
+            _ => 1,
+        }
+    }
+
+    pub fn output_count(&self) -> usize {
+        match self.kind {
+            Kind::Note { .. } | Kind::SubflowOutput => 0,
+            _ => 1,
+        }
     }
 
     pub fn display_title(&self) -> &str {
@@ -307,13 +356,23 @@ impl Node {
             Kind::Threshold { .. } => "threshold",
             Kind::Keyboard { .. } => "keyboard",
             Kind::Click { .. } => "click",
+            Kind::ValidateNumber { .. } => "validate_number",
+            Kind::Event { .. } => "event",
+            Kind::Note { .. } => "note",
+            Kind::Subflow { .. } => "subflow",
+            Kind::SubflowInput => "subflow_input",
+            Kind::SubflowOutput => "subflow_output",
         }
     }
 
     pub(crate) fn reset_input_state(&mut self) {
-        if let Kind::CompareInputs { values, last, .. } = &mut self.kind {
-            *values = [None, None];
-            *last = None;
+        match &mut self.kind {
+            Kind::CompareInputs { values, last, .. } => {
+                *values = [None, None];
+                *last = None;
+            }
+            Kind::Subflow { graph } => graph.reset_runtime(),
+            _ => {}
         }
     }
 
@@ -351,6 +410,15 @@ impl Node {
         &mut self,
         inputs: &[Value],
         backend: &mut dyn Backend,
+    ) -> Result<Option<Value>, String> {
+        self.process_with_depth(inputs, backend, 0)
+    }
+
+    pub(crate) fn process_with_depth(
+        &mut self,
+        inputs: &[Value],
+        backend: &mut dyn Backend,
+        depth: usize,
     ) -> Result<Option<Value>, String> {
         let region = self.region.unwrap_or_default();
         let hysteresis = matches!(self.kind, Kind::Hysteresis { .. });
@@ -521,6 +589,39 @@ impl Node {
                 log::info!("[CLICK] Clicking at ({}, {}) with button: {}", x, y, button);
                 backend.click(x, y, button)?;
                 Ok(Some(Value::Bool(true)))
+            }
+            Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
+                let Some(input) = inputs.first() else { return Ok(None) };
+                let text = input.to_text();
+                let number = match input {
+                    Value::Int(n) => Some(*n as f64),
+                    Value::Num(n) => Some(*n),
+                    Value::Text(s) => s.trim().parse::<f64>().ok(),
+                    Value::Bool(_) => None,
+                };
+                let regex_ok = pattern.is_empty() || regex::Regex::new(pattern)
+                    .map(|regex| regex.is_match(&text)).unwrap_or(false);
+                let accepted = number.filter(|n| n.is_finite()
+                    && regex_ok
+                    && minimum.map_or(true, |v| v.is_finite() && *n >= v)
+                    && maximum.map_or(true, |v| v.is_finite() && *n <= v)
+                    && max_change.map_or(true, |v| v.is_finite() && v >= 0.0
+                        && last.map_or(true, |previous| (*n - previous).abs() <= v)));
+                if let Some(number) = accepted {
+                    *last = Some(number);
+                    Ok(Some(input.clone()))
+                } else {
+                    log::warn!("[VALIDATE NUMBER] Rejected '{}' at node '{}'", text, self.name);
+                    Ok(None)
+                }
+            }
+            Kind::Event { .. } | Kind::Note { .. } | Kind::SubflowInput => Ok(None),
+            Kind::SubflowOutput => Ok(inputs.first().cloned()),
+            Kind::Subflow { graph } => {
+                if inputs.is_empty() && graph.uses_subflow_input() {
+                    return Ok(None);
+                }
+                graph.run_subflow(inputs.first().cloned(), backend, depth + 1)
             }
         }
     }

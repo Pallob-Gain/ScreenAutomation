@@ -13,6 +13,9 @@ use screen_automation::{
     node::{CompareOp, Crossing, Format, Kind, Node, Value},
     session_log::SessionLog,
     screen_events::{ScreenEvents, ScreenRegion},
+    event_sources::{EventRegistration, EventSource, EventSources},
+    preview::{PreviewSession, StepResult},
+    workspace::{GraphHistory, Recovery, Workspace},
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,12 +24,15 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+mod editor;
+use editor::{event_settings, optional_number};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FileAction {
     New,
     Load,
     Exit,
+    Recent(PathBuf),
 }
 
 #[derive(Clone, Copy)]
@@ -68,12 +74,28 @@ struct App {
     pending_file_action: Option<FileAction>,
     save_error: Option<String>,
     close_confirmed: bool,
+    history: GraphHistory,
+    workspace: Option<Workspace>,
+    recovery: Option<Recovery>,
+    recovery_error: Option<String>,
+    last_autosave: Instant,
+    search_open: bool,
+    search_text: String,
+    fit_view: bool,
+    focus_node: Option<String>,
+    validation_open: bool,
+    validation: Vec<screen_automation::graph::GraphIssue>,
+    preview: Option<PreviewSession>,
+    preview_steps: Vec<StepResult>,
+    preview_open: bool,
+    subflow_editor: Option<(String, Box<App>)>,
+    extra_events: Option<EventSources>,
     status: String,
     logs: SessionLog,
     logs_expanded: bool,
 }
 
-const KINDS: [&str; 10] = [
+const KINDS: [&str; 16] = [
     "ocr",
     "model",
     "function",
@@ -84,6 +106,12 @@ const KINDS: [&str; 10] = [
     "click",
     "compare_inputs",
     "constant",
+    "validate_number",
+    "event",
+    "note",
+    "subflow",
+    "subflow_input",
+    "subflow_output",
 ];
 const GRAPH_ID: &str = "workflow-graph";
 const CANVAS_RESPONSE_ID: &str = "canvas-background-response";
@@ -93,6 +121,7 @@ const TRASH_RECT_ID: &str = "trash-rect";
 const OVERLAY_SETTLE_DELAY: Duration = Duration::from_millis(150);
 const OVERLAY_MARGIN: f32 = 6.0;
 const OVERLAY_HEADER: f32 = 24.0;
+const OVERLAY_MIN_CAPTURE_SIZE: egui::Vec2 = egui::vec2(80.0, 1.0);
 const OVERLAY_PLACEMENT_ATTEMPTS: u8 = 5;
 
 fn configure_cursors(ctx: &egui::Context) {
@@ -123,13 +152,18 @@ fn overlay_capture_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
+fn overlay_min_inner_size() -> egui::Vec2 {
+    OVERLAY_MIN_CAPTURE_SIZE
+        + egui::vec2(2.0 * OVERLAY_MARGIN, OVERLAY_HEADER + OVERLAY_MARGIN)
+}
+
 fn capture_region(inner_rect: egui::Rect) -> Region {
     let rect = overlay_capture_rect(inner_rect);
     Region {
         x: rect.min.x.round() as i32,
         y: rect.min.y.round() as i32,
-        width: rect.width().round().max(80.0) as u32,
-        height: rect.height().round().max(60.0) as u32,
+        width: rect.width().round().max(OVERLAY_MIN_CAPTURE_SIZE.x) as u32,
+        height: rect.height().round().max(OVERLAY_MIN_CAPTURE_SIZE.y) as u32,
     }
 }
 
@@ -229,26 +263,46 @@ fn with_physical_regions<T>(
     scales: &HashMap<String, f32>,
     run: impl FnOnce(&mut Graph) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut regions = Vec::new();
-    for (index, node) in graph.nodes.iter().enumerate() {
+    let mut regions = HashMap::new();
+    let mut missing = None;
+    visit_nodes_mut(graph, "", &mut |node, key| {
         if let Some(region) = node.region {
-            let Some(&scale) = scales.get(&node.name) else {
-                return Err(format!(
-                    "Screen region for {} is not available yet; try again",
-                    node.name
-                ));
-            };
-            regions.push((index, region, physical_region(region, scale)));
+            if let Some(&scale) = scales.get(key) {
+                regions.insert(key.to_owned(), (region, physical_region(region, scale)));
+            } else {
+                missing = Some(format!("Screen region for {key} is not available yet; try again"));
+            }
+        }
+    });
+    if let Some(error) = missing { return Err(error); }
+    visit_nodes_mut(graph, "", &mut |node, key| {
+        if let Some((_, physical)) = regions.get(key) { node.region = Some(*physical); }
+    });
+    let result = run(graph);
+    visit_nodes_mut(graph, "", &mut |node, key| {
+        if let Some((original, _)) = regions.get(key) { node.region = Some(*original); }
+    });
+    result
+}
+
+fn region_key(prefix: &str, name: &str) -> String {
+    format!("{prefix}{}", name.replace('~', "~0").replace('/', "~1"))
+}
+
+fn visit_nodes_mut(graph: &mut Graph, prefix: &str, visit: &mut impl FnMut(&mut Node, &str)) {
+    for node in &mut graph.nodes {
+        let key = region_key(prefix, &node.name);
+        visit(node, &key);
+        if let Kind::Subflow { graph } = &mut node.kind {
+            visit_nodes_mut(graph, &format!("{key}/"), visit);
         }
     }
-    for (index, _, physical) in &regions {
-        graph.nodes[*index].region = Some(*physical);
-    }
-    let result = run(graph);
-    for (index, original, _) in regions {
-        graph.nodes[index].region = Some(original);
-    }
-    result
+}
+
+struct OverlayState<'a> {
+    scales: &'a mut HashMap<String, f32>,
+    anchors: &'a mut HashMap<String, Region>,
+    targets: &'a mut HashMap<String, (Region, u8)>,
 }
 
 const WIRE_FLASH: Duration = Duration::from_millis(1000);
@@ -295,6 +349,12 @@ fn node_style(kind: &Kind) -> (Color32, &'static str) {
         Kind::Threshold { .. } => (Color32::from_rgb(170, 205, 160), "↕"),
         Kind::Keyboard { .. } => (Color32::from_rgb(192, 184, 224), "⌨"),
         Kind::Click { .. } => (Color32::from_rgb(166, 187, 207), "🖱"),
+        Kind::ValidateNumber { .. } => (Color32::from_rgb(130, 205, 170), "?"),
+        Kind::Event { .. } => (Color32::from_rgb(230, 170, 110), "!"),
+        Kind::Note { .. } => (Color32::from_rgb(245, 230, 150), "#"),
+        Kind::Subflow { .. } => (Color32::from_rgb(160, 170, 225), "{}"),
+        Kind::SubflowInput => (Color32::from_rgb(170, 195, 220), ">"),
+        Kind::SubflowOutput => (Color32::from_rgb(170, 195, 220), "<"),
     }
 }
 
@@ -365,6 +425,12 @@ fn node_description(node: &Node) -> String {
         },
         Kind::Keyboard { .. } => "Type text into a screen region".into(),
         Kind::Click { .. } => "Click a screen region".into(),
+        Kind::ValidateNumber { .. } => "Reject invalid numeric/OCR readings before they reach actions".into(),
+        Kind::Event { event } => format!("Event source: {}", event.label()),
+        Kind::Note { text } => text.clone(),
+        Kind::Subflow { graph } => format!("Embedded reusable workflow ({} nodes)", graph.nodes.len()),
+        Kind::SubflowInput => "Input value supplied by the containing subflow".into(),
+        Kind::SubflowOutput => "Return a value from the containing subflow".into(),
     }
 }
 
@@ -512,7 +578,19 @@ fn new_kind(i: usize) -> Kind {
             last: None,
             values: [None, None],
         },
-        _ => Kind::Constant { value: "0".into(), format: Format::Number },
+        9 => Kind::Constant { value: "0".into(), format: Format::Number },
+        10 => Kind::ValidateNumber { minimum: None, maximum: None, max_change: None, pattern: String::new(), last: None },
+        11 => Kind::Event { event: EventSource::Timer { interval_ms: 1000 } },
+        12 => Kind::Note { text: "Add your notes here".into() },
+        13 => {
+            let mut graph = Graph::default();
+            graph.add_node(Node::new("input", Kind::SubflowInput)).expect("unique input");
+            graph.add_node(Node::new("output", Kind::SubflowOutput)).expect("unique output");
+            graph.connect("input", "output").expect("valid subflow edge");
+            Kind::Subflow { graph: Box::new(graph) }
+        }
+        14 => Kind::SubflowInput,
+        _ => Kind::SubflowOutput,
     }
 }
 
@@ -533,6 +611,8 @@ struct GraphViewer<'a> {
     activity: &'a HashMap<String, (Instant, String)>,
     selected: Option<usize>,
     now: Instant,
+    fit: Option<(egui::Rect, egui::Rect)>,
+    validation: &'a [screen_automation::graph::GraphIssue],
 }
 
 impl GraphViewer<'_> {
@@ -562,7 +642,9 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
     ) -> egui::Frame {
         let index = snarl[node];
         let frame = default.fill(node_style(&self.graph.nodes[index].kind).0);
-        if self.selected == Some(index) {
+        if self.validation.iter().any(|issue| issue.node.as_deref() == Some(&self.graph.nodes[index].name)) {
+            frame.stroke(egui::Stroke::new(2.0, Color32::RED))
+        } else if self.selected == Some(index) {
             frame.stroke(egui::Stroke::new(2.0, NODE_SELECTED))
         } else {
             frame
@@ -602,11 +684,7 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
     }
 
     fn inputs(&mut self, node: &usize) -> usize {
-        match self.graph.nodes[*node].kind {
-            Kind::Ocr { .. } | Kind::Constant { .. } => 0,
-            Kind::CompareInputs { .. } => 2,
-            _ => 1,
-        }
+        self.graph.nodes[*node].input_count()
     }
 
     fn show_input(
@@ -618,8 +696,8 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         wire_pin(self.input_glow(snarl[pin.id.node], pin.id.input))
     }
 
-    fn outputs(&mut self, _: &usize) -> usize {
-        1
+    fn outputs(&mut self, node: &usize) -> usize {
+        self.graph.nodes[*node].output_count()
     }
 
     fn show_output(
@@ -646,6 +724,14 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
     ) {
         let index = snarl[node];
         let node = &self.graph.nodes[index];
+        if let Kind::Note { text } = &node.kind {
+            ui.vertical(|ui| {
+                ui.set_width(240.0);
+                ui.strong(node.display_title());
+                ui.label(text);
+            });
+            return;
+        }
         let (_, icon) = node_style(&node.kind);
         let label = ui.painter().layout_no_wrap(
             node_label(node),
@@ -786,6 +872,61 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         self.graph.disconnect_input(&source, &destination, to.id.input);
         snarl.disconnect(from.id, to.id);
     }
+
+    fn drop_inputs(&mut self, pin: &InPin, snarl: &mut Snarl<usize>) {
+        for remote in pin.remotes.clone() {
+            let from = snarl.out_pin(remote);
+            self.disconnect(&from, pin, snarl);
+        }
+    }
+
+    fn drop_outputs(&mut self, pin: &OutPin, snarl: &mut Snarl<usize>) {
+        for remote in pin.remotes.clone() {
+            let to = snarl.in_pin(remote);
+            self.disconnect(pin, &to, snarl);
+        }
+    }
+
+    fn current_transform(&mut self, transform: &mut egui::emath::TSTransform, _: &mut Snarl<usize>) {
+        if let Some((bounds, canvas)) = self.fit {
+            let scale = (canvas.width() / bounds.width()).min(canvas.height() / bounds.height()).clamp(f32::MIN_POSITIVE, 2.0);
+            *transform = egui::emath::TSTransform::new(canvas.center().to_vec2() - bounds.center().to_vec2() * scale, scale);
+        }
+    }
+
+    fn draw_background(
+        &mut self, background: Option<&BackgroundPattern>, viewport: &egui::Rect,
+        style: &SnarlStyle, ui_style: &egui::Style, painter: &egui::Painter, snarl: &Snarl<usize>,
+    ) {
+        if let Some(background) = background {
+            background.draw(viewport, style, ui_style, painter);
+        }
+        let mut groups: HashMap<&str, egui::Rect> = HashMap::new();
+        for (_, position, index) in snarl.nodes_pos_ids() {
+            let node = &self.graph.nodes[*index];
+            if !node.group.trim().is_empty() {
+                let rect = egui::Rect::from_min_size(position, canvas_node_size(painter, node)).expand(18.0);
+                groups.entry(&node.group).and_modify(|bounds| *bounds = bounds.union(rect)).or_insert(rect);
+            }
+        }
+        for (name, rect) in groups {
+            painter.rect(rect, 8, Color32::from_rgba_unmultiplied(100, 140, 200, 15),
+                egui::Stroke::new(1.0, Color32::from_rgb(150, 175, 205)), egui::StrokeKind::Outside);
+            painter.text(rect.left_top() + egui::vec2(4.0, -4.0), egui::Align2::LEFT_BOTTOM,
+                name, egui::FontId::proportional(13.0), Color32::from_rgb(80, 105, 145));
+        }
+    }
+}
+
+fn canvas_node_size(painter: &egui::Painter, node: &Node) -> egui::Vec2 {
+    let font = egui::FontId::proportional(14.0);
+    if let Kind::Note { text } = &node.kind {
+        let text = painter.layout(text.clone(), font, NODE_TEXT, 240.0);
+        return egui::vec2(260.0, text.size().y + 40.0);
+    }
+    let label = painter.layout_no_wrap(node_label(node), font, NODE_TEXT);
+    egui::vec2((NODE_ICON_WIDTH + label.size().x + 24.0).max(NODE_MIN_WIDTH) + 10.0,
+        NODE_HEIGHT * node.input_count().max(1) as f32 + 10.0)
 }
 
 impl App {
@@ -809,6 +950,8 @@ impl App {
                 self.saved_graph = contents;
                 self.status = "Saved workflow".into();
                 self.logs.record(log::Level::Info, format_args!("[FILE] Saved {}", path.display()));
+                self.remember_file(path);
+                self.clear_recovery();
                 true
             }
             Err(error) => {
@@ -822,6 +965,7 @@ impl App {
 
     fn replace_graph(&mut self, graph: Graph, file: Option<PathBuf>) {
         self.set_running(false);
+        self.leave_subflows();
         self.graph = graph;
         self.refresh_input = self.graph.settings.refresh_ms.to_string();
         self.file = file;
@@ -837,6 +981,14 @@ impl App {
         self.pending_file_action = None;
         self.save_error = None;
         self.close_confirmed = false;
+        self.history = GraphHistory::new(self.graph.to_json());
+        self.validation = self.graph.validate();
+        self.preview = None;
+        self.preview_steps.clear();
+        self.subflow_editor = None;
+        self.fit_view = true;
+        self.focus_node = None;
+        self.clear_recovery();
     }
 
     fn load_graph(&mut self, path: &Path) {
@@ -848,6 +1000,7 @@ impl App {
                 self.replace_graph(graph, Some(path.to_path_buf()));
                 self.status = "Loaded workflow".into();
                 self.logs.record(log::Level::Info, format_args!("[FILE] Loaded {}", path.display()));
+                self.remember_file(path);
             }
             Err(error) => self.record_status(log::Level::Error, format!("Could not load {}: {error}", path.display())),
         }
@@ -909,14 +1062,16 @@ impl App {
                 }
             }
             FileAction::Exit => {
+                self.clear_recovery();
                 self.close_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            FileAction::Recent(path) => self.load_graph(&path),
         }
     }
 
     fn resolve_unsaved_changes(&mut self, choice: UnsavedChoice, ctx: &egui::Context) {
-        let Some(action) = self.pending_file_action else {
+        let Some(action) = self.pending_file_action.clone() else {
             return;
         };
         if matches!(choice, UnsavedChoice::Save) && !self.save_current_graph() {
@@ -936,12 +1091,13 @@ impl App {
                 self.request_file_action(FileAction::Exit, ctx);
             } else {
                 self.set_running(false);
+                self.clear_recovery();
             }
         }
     }
 
     fn show_unsaved_changes(&mut self, ctx: &egui::Context) {
-        let Some(action) = self.pending_file_action else {
+        let Some(action) = self.pending_file_action.clone() else {
             return;
         };
         let mut choice = None;
@@ -950,7 +1106,7 @@ impl App {
             ui.heading("Unsaved changes");
             let operation = match action {
                 FileAction::New => "creating a new graph",
-                FileAction::Load => "loading another graph",
+                FileAction::Load | FileAction::Recent(_) => "loading another graph",
                 FileAction::Exit => "closing ScreenAutomation",
             };
             ui.label(format!("Save changes to {} before {operation}?",
@@ -992,6 +1148,19 @@ impl App {
                     ui.close();
                     self.request_file_action(FileAction::Load, ui.ctx());
                 }
+                let recent = self.workspace.as_ref().map(|workspace| workspace.recent.clone()).unwrap_or_default();
+                ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                    ui.menu_button("Recent files", |ui| {
+                        for path in &recent {
+                            if ui.button(path.file_name().unwrap_or(path.as_os_str()).to_string_lossy())
+                                .on_hover_text(path.display().to_string()).clicked()
+                            {
+                                ui.close();
+                                self.request_file_action(FileAction::Recent(path.clone()), ui.ctx());
+                            }
+                        }
+                    });
+                });
                 ui.separator();
                 if ui.button("Save").clicked() {
                     ui.close();
@@ -1005,6 +1174,40 @@ impl App {
                 if ui.button("Exit").clicked() {
                     ui.close();
                     self.request_file_action(FileAction::Exit, ui.ctx());
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo    Ctrl+Z")).clicked() {
+                    self.undo_edit(ui.ctx(), false);
+                    ui.close();
+                }
+                if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo    Ctrl+Y")).clicked() {
+                    self.undo_edit(ui.ctx(), true);
+                    ui.close();
+                }
+                if ui.button("Find node...    Ctrl+F").clicked() {
+                    self.search_open = true;
+                    ui.close();
+                }
+                if ui.button("Fit graph    Ctrl+0").clicked() {
+                    self.fit_view = true;
+                    self.focus_node = None;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Validate graph").clicked() {
+                    self.validation = self.validation_issues();
+                    self.validation_open = true;
+                    ui.close();
+                }
+                if ui.button("Dry Run    F6").clicked() {
+                    self.preview_run(false);
+                    ui.close();
+                }
+                if ui.button("Step    F7").clicked() {
+                    self.preview_run(true);
+                    ui.close();
                 }
             });
             ui.menu_button("Settings", |ui| {
@@ -1031,7 +1234,7 @@ impl App {
                 ));
             }
             if response.on_hover_text("Start or stop automation. Esc also stops a running workflow.").clicked() {
-                self.set_running(!self.running);
+                self.toggle_run();
             }
         });
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
@@ -1050,13 +1253,11 @@ impl App {
                     RunMode::DisplayRefresh,
                     "Display refresh",
                 );
-                ui.add_enabled_ui(cfg!(windows), |ui| {
-                    ui.radio_value(
+                ui.radio_value(
                         &mut self.graph.settings.run_mode,
                         RunMode::HmiEvent,
-                        "HMI Event (screen change)",
+                        "HMI Event",
                     );
-                });
                 let timed = self.graph.settings.run_mode == RunMode::Timed;
                 ui.add_enabled_ui(timed, |ui| {
                     ui.horizontal(|ui| {
@@ -1083,9 +1284,9 @@ impl App {
                     ui.label("Checks once per app frame, paced by display VSync.");
                     ui.weak("Capture/OCR can reduce the rate. Minimizing the app may pause checks.");
                 } else {
-                    ui.label("Native screen-frame events trigger changed OCR regions and connected branches.");
-                    ui.weak("Windows only. The first snapshot is processed; only the latest pending frame is kept.");
-                    ui.weak("Sound and network event sources are not implemented yet.");
+                    ui.label("Screen changes and configured Event nodes trigger connected branches.");
+                    ui.weak("Screen changes and global hotkeys require Windows. Audio uses your default microphone.");
+                    ui.weak("HTTP webhooks listen only on this computer. Only the latest event per source is kept.");
                 }
                 ui.label("OCR runs only when its captured region changes.");
                 ui.weak("Mode and delay are saved with the graph.");
@@ -1219,12 +1420,14 @@ impl App {
     fn delete_node(&mut self, index: usize) {
         if let Some(node) = self.graph.nodes.get(index) {
             let name = node.name.clone();
+            let region = region_key("", &name);
+            let prefix = format!("{region}/");
             self.sync_graph_positions();
             self.graph.remove_node(&name);
-            self.region_scales.remove(&name);
+            self.region_scales.retain(|key, _| key != &region && !key.starts_with(&prefix));
             self.activity.remove(&name);
-            self.overlay_anchors.remove(&name);
-            self.overlay_targets.remove(&name);
+            self.overlay_anchors.retain(|key, _| key != &region && !key.starts_with(&prefix));
+            self.overlay_targets.retain(|key, _| key != &region && !key.starts_with(&prefix));
             self.selected = None;
             self.node_settings_open = false;
             self.rebuild_snarl();
@@ -1260,14 +1463,11 @@ impl App {
             return Ok(());
         }
         self.overlay_ready_at = None;
-        if self.backend.is_none() {
-            return Err("Desktop backend is unavailable".into());
-        }
         let mut regions = Vec::new();
         for node in &self.graph.nodes {
             if matches!(node.kind, Kind::Ocr { .. }) {
                 let region = node.region.ok_or_else(|| format!("OCR node '{}' has no region", node.name))?;
-                let scale = self.region_scales.get(&node.name)
+                let scale = self.region_scales.get(&region_key("", &node.name))
                     .ok_or_else(|| format!("Screen region for '{}' is not available yet", node.name))?;
                 regions.push(ScreenRegion {
                     name: node.name.clone(),
@@ -1275,14 +1475,18 @@ impl App {
                 });
             }
         }
-        if regions.is_empty() {
-            return Err("HMI Event mode requires at least one OCR node with a monitored region".into());
+        let registrations: Vec<_> = self.graph.nodes.iter().filter_map(|node| match &node.kind {
+            Kind::Event { event } => Some(EventRegistration { name: node.name.clone(), source: event.clone() }),
+            _ => None,
+        }).collect();
+        if regions.is_empty() && registrations.is_empty() {
+            return Err("HMI Event mode requires an OCR region or an Event node".into());
         }
         let definition = serde_json::to_string(&(
             &self.graph.edges,
             self.graph.nodes.iter().map(|node| (&node.name, &node.kind)).collect::<Vec<_>>(),
         )).map_err(|error| error.to_string())?;
-        if self.screen_events.is_some()
+        if (self.screen_events.is_some() || self.extra_events.is_some())
             && (self.event_regions != regions || self.event_definition != definition)
         {
             self.set_running(false);
@@ -1291,7 +1495,7 @@ impl App {
             ctx.request_repaint();
             return Ok(());
         }
-        if self.screen_events.is_none() {
+        if self.screen_events.is_none() && self.extra_events.is_none() {
             self.event_runtime = EventRuntime::default();
             for node in &mut self.graph.nodes {
                 match &mut node.kind {
@@ -1304,23 +1508,41 @@ impl App {
                 }
             }
             let wake_ctx = ctx.clone();
-            self.screen_events = Some(ScreenEvents::start(
-                regions.clone(), Arc::new(move || wake_ctx.request_repaint()),
-            )?);
+            let external_count = registrations.len();
+            if !regions.is_empty() {
+                self.screen_events = Some(ScreenEvents::start(
+                    regions.clone(), Arc::new(move || wake_ctx.request_repaint()),
+                )?);
+            }
+            if !registrations.is_empty() {
+                let wake_ctx = ctx.clone();
+                self.extra_events = Some(EventSources::start(
+                    registrations, Arc::new(move || wake_ctx.request_repaint()),
+                )?);
+            }
             self.event_regions = regions;
             self.event_definition = definition;
             self.logs.record(log::Level::Info, format_args!(
-                "[EVENT] Monitoring {} OCR region(s) for native screen changes", self.event_regions.len(),
+                "[EVENT] Monitoring {} OCR region(s) and {} external source(s)", self.event_regions.len(), external_count,
             ));
         }
-        let frames = self.screen_events.as_ref()
-            .ok_or("Screen event capture was not initialized")?.take_pending()?;
-        if frames.is_empty() {
+        let frames = match &self.screen_events {
+            Some(events) => events.take_pending()?,
+            None => Vec::new(),
+        };
+        let mut events = match &self.extra_events {
+            Some(events) => events.take_pending()?,
+            None => Vec::new(),
+        };
+        if frames.is_empty() && events.is_empty() {
             return Ok(());
         }
         let start = Instant::now();
-        let backend = self.backend.as_mut().ok_or("Desktop backend is unavailable")?;
-        let mut events = Vec::new();
+        let mut unavailable = editor::UnavailableBackend;
+        let backend: &mut dyn Backend = match self.backend.as_mut() {
+            Some(backend) => backend,
+            None => &mut unavailable,
+        };
         for frame in frames {
             let node = self.graph.nodes.iter_mut().find(|node| node.name == frame.name)
                 .ok_or_else(|| format!("Unknown screen event source: {}", frame.name))?;
@@ -1371,6 +1593,10 @@ impl App {
                     );
                 });
                 settings.weak(node.type_name());
+                settings.horizontal(|ui| {
+                    ui.label("Group");
+                    ui.text_edit_singleline(&mut node.group);
+                });
                 settings.separator();
                 let hysteresis = matches!(node.kind, Kind::Hysteresis { .. });
                 match &mut node.kind {
@@ -1524,6 +1750,33 @@ impl App {
                              It cannot guarantee that every decimal point is recognized.",
                         );
                     }
+                    Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
+                        let before = (*minimum, *maximum, *max_change, pattern.clone());
+                        optional_number(settings, "Minimum", minimum);
+                        optional_number(settings, "Maximum", maximum);
+                        optional_number(settings, "Maximum absolute change", max_change);
+                        settings.label("Required text pattern (regular expression, optional)");
+                        settings.text_edit_singleline(pattern);
+                        settings.weak("Use ^ and $ for a whole-value match, e.g. ^[0-9]+\\.[0-9]{2}$. Rejected readings never reach actions or update the last accepted value.");
+                        if before != (*minimum, *maximum, *max_change, pattern.clone()) {
+                            *last = None;
+                        }
+                    }
+                    Kind::Event { event } => event_settings(settings, event),
+                    Kind::Note { text } => {
+                        settings.add(egui::TextEdit::multiline(text).desired_rows(6).desired_width(300.0));
+                    }
+                    Kind::Subflow { .. } => {
+                        settings.weak("A self-contained workflow with Subflow Input and Subflow Output nodes. Shift-drag to reuse it.");
+                        if settings.button("Edit embedded workflow").clicked() {
+                            settings.data_mut(|data| data.insert_temp(Id::new("edit-subflow-request"), index));
+                        }
+                        if settings.button("Import workflow JSON...").clicked() {
+                            settings.data_mut(|data| data.insert_temp(Id::new("import-subflow-request"), index));
+                        }
+                    }
+                    Kind::SubflowInput => { settings.label("Supplies the containing node's input inside a subflow."); }
+                    Kind::SubflowOutput => { settings.label("Returns this input as the containing subflow's output."); }
                 }
                 if node.region.is_some() {
                     settings.separator();
@@ -1551,9 +1804,14 @@ impl App {
             self.selected = None;
             self.node_settings_open = false;
         }
+        self.handle_subflow_requests(ctx);
     }
 
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
+        if self.subflow_editor.is_some() {
+            self.show_subflow_canvas(ui);
+            return;
+        }
         let canvas_rect = ui.max_rect();
         let ctx = ui.ctx().clone();
         self.handle_copy_drag(&ctx);
@@ -1566,9 +1824,25 @@ impl App {
         ui.style_mut().interaction.selectable_labels = false;
         let graph_widget = SnarlWidget::new()
             .id(Id::new(GRAPH_ID))
-            .style(graph_style())
+            .style({
+                let mut style = graph_style();
+                style.min_scale = Some(f32::MIN_POSITIVE);
+                style
+            })
             .min_size(ui.available_size());
         let now = Instant::now();
+        let focus = self.focus_node.take().and_then(|name| self.snarl.nodes_pos_ids()
+            .find(|(_, _, index)| self.graph.nodes[**index].name == name)
+            .map(|(_, pos, index)| egui::Rect::from_min_size(pos, canvas_node_size(ui.painter(), &self.graph.nodes[*index])).expand(40.0)));
+        let fit = if let Some(bounds) = focus {
+            Some((bounds, canvas_rect.shrink(60.0)))
+        } else if self.fit_view && !self.graph.nodes.is_empty() {
+            let bounds = self.snarl.nodes_pos_ids().fold(egui::Rect::NOTHING, |bounds, (_, pos, index)| {
+                bounds.union(egui::Rect::from_min_size(pos, canvas_node_size(ui.painter(), &self.graph.nodes[*index])))
+            }).expand(36.0);
+            Some((bounds, canvas_rect.shrink(60.0)))
+        } else { None };
+        self.fit_view = false;
         let response = graph_widget.show(
             &mut self.snarl,
             &mut GraphViewer {
@@ -1577,6 +1851,8 @@ impl App {
                 activity: &self.activity,
                 selected: self.selected,
                 now,
+                fit,
+                validation: &self.validation,
             },
             ui,
         );
@@ -1630,9 +1906,10 @@ impl App {
                 .fixed_pos(canvas_rect.right_top() + egui::vec2(-12.0, 64.0))
                 .show(&ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height((canvas_rect.height() - 150.0).max(100.0)).show(ui, |ui| {
                         for (index, kind) in KINDS.iter().enumerate() {
                             let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(112.0, 30.0), egui::Sense::hover());
+                                .allocate_exact_size(egui::vec2(170.0, 30.0), egui::Sense::hover());
                             let response = ui.interact(
                                 rect,
                                 Id::new(("canvas-add-kind", index)),
@@ -1661,6 +1938,7 @@ impl App {
                                 selected_kind = Some(index);
                             }
                         }
+                        });
                     });
                 });
             if let Some(index) = selected_kind {
@@ -1725,36 +2003,44 @@ impl App {
         self.show_settings(&ctx);
     }
 
-    fn overlay(&mut self, ctx: &egui::Context, idx: usize) {
+    fn show_overlays(&mut self, ctx: &egui::Context) {
         let running = self.running;
-        let node = &mut self.graph.nodes[idx];
+        let locked = self.pending_file_action.is_some() || self.recovery.is_some() || self.recovery_error.is_some();
+        let mut state = OverlayState {
+            scales: &mut self.region_scales,
+            anchors: &mut self.overlay_anchors,
+            targets: &mut self.overlay_targets,
+        };
+        visit_nodes_mut(&mut self.graph, "", &mut |node, key| {
+            Self::overlay_node(ctx, node, key, running, locked, &mut state);
+        });
+    }
+
+    fn overlay_node(ctx: &egui::Context, node: &mut Node, key: &str, running: bool, locked: bool, state: &mut OverlayState<'_>) {
         let Some(region) = node.region else {
             return;
         };
         // The builder position/size must stay constant: egui re-applies any change to it as a
         // window move, and feeding the measured region back in makes the window creep each frame.
-        let anchor = match self.overlay_anchors.get(&node.name) {
+        let anchor = match state.anchors.get(key) {
             Some(anchor) => *anchor,
             None => {
-                self.overlay_anchors.insert(node.name.clone(), region);
-                self.overlay_targets
-                    .insert(node.name.clone(), (region, OVERLAY_PLACEMENT_ATTEMPTS));
+                state.anchors.insert(key.to_owned(), region);
+                state.targets
+                    .insert(key.to_owned(), (region, OVERLAY_PLACEMENT_ATTEMPTS));
                 region
             }
         };
-        let id = ViewportId::from_hash_of(("overlay", &node.name));
+        let id = ViewportId::from_hash_of(("overlay", key));
         let builder = ViewportBuilder::default()
             .with_title(node.display_title())
             .with_decorations(false)
             .with_transparent(true)
             .with_has_shadow(false)
             .with_resizable(true)
-            .with_min_inner_size([
-                80.0 + 2.0 * OVERLAY_MARGIN,
-                60.0 + OVERLAY_HEADER + OVERLAY_MARGIN,
-            ])
+            .with_min_inner_size(overlay_min_inner_size())
             .with_always_on_top()
-            .with_mouse_passthrough(running || self.pending_file_action.is_some())
+            .with_mouse_passthrough(running || locked)
             .with_position([
                 anchor.x as f32 - OVERLAY_MARGIN,
                 anchor.y as f32 - OVERLAY_HEADER,
@@ -1768,7 +2054,7 @@ impl App {
         let fill = Color32::from_rgba_unmultiplied(red, green, blue, alpha);
         let outline = Color32::from_rgba_unmultiplied(255, 40, 40, alpha);
         let title = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
-        let name = node.name.clone();
+        let name = key.to_owned();
         let label = node.display_title().to_owned();
         ctx.show_viewport_immediate(id, builder, |ctx, _| {
             let viewport_ctx = ctx.clone();
@@ -1807,13 +2093,9 @@ impl App {
                                 .data(|data| data.get_temp::<egui::Pos2>(start_pos_id))
                                 .unwrap_or(current_pos);
                             let delta = current_pos - start_pos;
-                            let size = start_size + egui::vec2(delta.x, delta.y);
+                            let size = (start_size + egui::vec2(delta.x, delta.y)).max(overlay_min_inner_size());
                             viewport_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                                [
-                                    size.x.max(80.0 + 2.0 * OVERLAY_MARGIN),
-                                    size.y.max(60.0 + OVERLAY_HEADER + OVERLAY_MARGIN),
-                                ]
-                                .into(),
+                                size,
                             ));
                         }
                     }
@@ -1833,7 +2115,7 @@ impl App {
         let Some(inner) = inner else {
             return;
         };
-        if let Some((target, attempts)) = self.overlay_targets.get_mut(&node.name) {
+        if let Some((target, attempts)) = state.targets.get_mut(key) {
             let correction = outer.and_then(|outer| overlay_correction(*target, inner, outer));
             match correction {
                 Some(position) if *attempts > 0 => {
@@ -1843,13 +2125,13 @@ impl App {
                     return;
                 }
                 _ => {
-                    self.overlay_targets.remove(&node.name);
+                    state.targets.remove(key);
                 }
             }
         }
         node.region = Some(capture_region(inner));
         if scale.is_finite() && scale > 0.0 {
-            self.region_scales.insert(node.name.clone(), scale);
+            state.scales.insert(key.to_owned(), scale);
         }
     }
 }
@@ -1956,7 +2238,7 @@ impl App {
                         "[RUN] Workflow started (display refresh / VSync)",
                     )),
                     RunMode::HmiEvent => self.logs.record(log::Level::Info, format_args!(
-                        "[RUN] Workflow started (HMI Event / native screen changes)",
+                        "[RUN] Workflow started (HMI Event / screen and external sources)",
                     )),
                 }
             } else {
@@ -1968,6 +2250,11 @@ impl App {
             if let Some(mut events) = self.screen_events.take() {
                 if let Err(error) = events.stop() {
                     self.record_status(log::Level::Error, format!("Could not stop screen events: {error}"));
+                }
+            }
+            if let Some(mut events) = self.extra_events.take() {
+                if let Err(error) = events.stop() {
+                    self.record_status(log::Level::Error, format!("Could not stop event sources: {error}"));
                 }
             }
             self.event_runtime = EventRuntime::default();
@@ -2017,7 +2304,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_escape(&ctx);
-        egui::Panel::top("menu-bar").show(ui, |ui| self.show_menu_bar(ui));
+        self.handle_shortcuts(&ctx, true);
+        egui::Panel::top("menu-bar").show(ui, |ui| {
+            if self.subflow_editor.is_some() { self.show_subflow_menu(ui); }
+            else { self.show_menu_bar(ui); }
+        });
         self.show_logs(ui);
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -2025,11 +2316,12 @@ impl eframe::App for App {
         });
         self.show_timing_settings(&ctx);
 
-        for index in 0..self.graph.nodes.len() {
-            self.overlay(&ctx, index);
-        }
+        self.show_overlays(&ctx);
         self.handle_close_request(&ctx);
         self.show_unsaved_changes(&ctx);
+        self.show_editor_windows(&ctx);
+        self.capture_history(&ctx);
+        self.autosave(&ctx);
 
         if self.running {
             if self.graph.settings.run_mode == RunMode::HmiEvent {
@@ -2080,41 +2372,8 @@ fn main() -> eframe::Result {
     if !status.is_empty() {
         logs.record(log::Level::Error, format_args!("[APP] {status}"));
     }
-    let mut app = App {
-        graph: Graph::default(),
-        snarl: Snarl::new(),
-        backend,
-        kind: 0,
-        selected: None,
-        node_settings_open: false,
-        copy_drag: None,
-        add_menu_open: false,
-        running: false,
-        overlay_ready_at: None,
-        last_tick: Instant::now(),
-        last_run_duration: None,
-        last_run_interval: None,
-        last_run_frame: None,
-        refresh_input: DEFAULT_REFRESH_MS.to_string(),
-        timing_settings_open: false,
-        screen_events: None,
-        event_regions: Vec::new(),
-        event_definition: String::new(),
-        event_runtime: EventRuntime::default(),
-        region_scales: HashMap::new(),
-        activity: HashMap::new(),
-        escape_pressed: Arc::new(AtomicBool::new(false)),
-        overlay_anchors: HashMap::new(),
-        overlay_targets: HashMap::new(),
-        file: None,
-        saved_graph: Graph::default().to_json(),
-        pending_file_action: None,
-        save_error: None,
-        close_confirmed: false,
-        status,
-        logs,
-        logs_expanded: false,
-    };
+    let mut app = App::new(backend, status, logs);
+    app.initialize_workspace();
     app.rebuild_snarl();
     eframe::run_native(
         "ScreenAutomation",
@@ -2163,6 +2422,26 @@ mod tests {
             overlay_correction(target, moved, outer.translate(position - outer.min)),
             None
         );
+    }
+
+    #[test]
+    fn resizing_overlay_preserves_thin_capture_regions_and_a_nonzero_minimum() {
+        let ctx = egui::Context::default();
+        for (requested_height, expected_height) in [(0.0, 1), (1.0, 1), (12.0, 12), (30.0, 30), (59.0, 59), (120.0, 120)] {
+            let size = egui::vec2(312.0, requested_height + OVERLAY_HEADER + OVERLAY_MARGIN)
+                .max(overlay_min_inner_size());
+            let window = egui::Rect::from_min_size(Pos2::new(94.0, 76.0), size);
+            assert_eq!(capture_region(window), Region {
+                x: 100, y: 100, width: 300, height: expected_height,
+            });
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(window), ..Default::default()
+            }, |ui| {
+                let grip = paint_overlay(ui, window, "ocr1", Color32::BLUE, Color32::RED, Color32::BLACK, false);
+                assert!(window.contains_rect(grip), "resize handle outside thin window");
+            });
+            output.textures_delta.clear();
+        }
     }
 
     #[test]
@@ -2354,41 +2633,9 @@ mod tests {
     }
 
     fn app() -> App {
-        App {
-            graph: Graph::default(),
-            snarl: Snarl::new(),
-            backend: None,
-            kind: 1,
-            selected: None,
-            node_settings_open: false,
-            copy_drag: None,
-            add_menu_open: false,
-            running: false,
-            overlay_ready_at: None,
-            last_tick: Instant::now(),
-            last_run_duration: None,
-            last_run_interval: None,
-            last_run_frame: None,
-            refresh_input: DEFAULT_REFRESH_MS.to_string(),
-            timing_settings_open: false,
-            screen_events: None,
-            event_regions: Vec::new(),
-            event_definition: String::new(),
-            event_runtime: EventRuntime::default(),
-            region_scales: HashMap::new(),
-            activity: HashMap::new(),
-            escape_pressed: Arc::new(AtomicBool::new(false)),
-            overlay_anchors: HashMap::new(),
-            overlay_targets: HashMap::new(),
-            file: None,
-            saved_graph: Graph::default().to_json(),
-            pending_file_action: None,
-            save_error: None,
-            close_confirmed: false,
-            status: String::new(),
-            logs: SessionLog::default(),
-            logs_expanded: false,
-        }
+        let mut app = App::new(None, String::new(), SessionLog::default());
+        app.kind = 1;
+        app
     }
 
     #[test]
@@ -2739,14 +2986,14 @@ mod tests {
             let edited = app.graph.to_json();
             let ctx = egui::Context::default();
             app.set_running(true);
-            app.request_file_action(action, &ctx);
+            app.request_file_action(action.clone(), &ctx);
             assert!(!app.running);
-            assert_eq!(app.pending_file_action, Some(action));
+            assert_eq!(app.pending_file_action, Some(action.clone()));
             app.resolve_unsaved_changes(UnsavedChoice::Cancel, &ctx);
             assert_eq!(app.pending_file_action, None);
             assert_eq!(app.graph.to_json(), edited);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
-            app.request_file_action(action, &ctx);
+            app.request_file_action(action.clone(), &ctx);
             let mut output = ctx.run_ui(Default::default(), |ui| {
                 app.resolve_unsaved_changes(UnsavedChoice::Save, ui.ctx());
             });
@@ -2779,12 +3026,12 @@ mod tests {
             let edited = app.graph.to_json();
             let baseline = app.saved_graph.clone();
             let ctx = egui::Context::default();
-            app.request_file_action(action, &ctx);
+            app.request_file_action(action.clone(), &ctx);
             let mut output = ctx.run_ui(Default::default(), |ui| {
                 app.resolve_unsaved_changes(UnsavedChoice::Save, ui.ctx());
                 app.show_unsaved_changes(ui.ctx());
             });
-            assert_eq!(app.pending_file_action, Some(action));
+            assert_eq!(app.pending_file_action, Some(action.clone()));
             assert_eq!(app.graph.to_json(), edited);
             assert_eq!(app.saved_graph, baseline);
             assert!(app.has_unsaved_changes());
@@ -3031,7 +3278,7 @@ mod tests {
         #[cfg(windows)]
         {
             let output = menu_frame(&mut app, vec![]);
-            let event_mode = text_position(&output, "HMI Event (screen change)");
+            let event_mode = text_position(&output, "HMI Event");
             menu_frame(&mut app, vec![egui::Event::PointerMoved(event_mode), button(event_mode, true)]);
             menu_frame(&mut app, vec![button(event_mode, false)]);
             menu_frame(&mut app, vec![]);
