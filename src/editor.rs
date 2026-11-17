@@ -861,6 +861,140 @@ mod tests {
     }
 
     #[test]
+    fn compare_setting_checkbox_adds_labeled_pin_and_disables_fixed_editor() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.kind = 3;
+        app.add_node();
+        if let Kind::Compare { value, .. } = &mut app.graph.nodes[0].kind {
+            *value = "123.45".into();
+        }
+        app.selected = Some(0);
+        app.node_settings_open = true;
+        let checkbox = format!("{} from input", InputParameter::CompareValue.label());
+        for enabled in [true, false] {
+            render(&ctx, &mut app, vec![]);
+            let output = render(&ctx, &mut app, vec![]);
+            let position = text_position(&output, &checkbox);
+            render(&ctx, &mut app, vec![
+                egui::Event::PointerMoved(position), pointer_button(position, true),
+            ]);
+            render(&ctx, &mut app, vec![pointer_button(position, false)]);
+            render(&ctx, &mut app, vec![]);
+            let output = render(&ctx, &mut app, vec![]);
+            let node = &app.graph.nodes[0];
+            assert_eq!(node.input_count(), if enabled { 2 } else { 1 });
+            let field = Id::new(("fixed-parameter", 0usize, InputParameter::CompareValue.label()));
+            assert_eq!(ctx.read_response(field).unwrap().enabled(), !enabled);
+            assert!(matches!(&node.kind, Kind::Compare { value, .. } if value == "123.45"));
+            if enabled {
+                text_position(&output, node.input_label(1));
+                assert!(node_label(node).contains("input"));
+                assert!(!node_label(node).contains("123.45"));
+            } else {
+                assert!(node_label(node).contains("123.45"));
+            }
+        }
+    }
+
+    #[test]
+    fn bound_checkboxes_preserve_other_wires_when_ports_change_and_support_undo() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.kind = 5;
+        app.add_node();
+        for _ in 0..3 {
+            app.kind = 9;
+            app.add_node();
+        }
+        let target = app.graph.nodes[0].name.clone();
+        let main = app.graph.nodes[1].name.clone();
+        let upper = app.graph.nodes[2].name.clone();
+        let lower = app.graph.nodes[3].name.clone();
+        app.graph.connect(&main, &target).unwrap();
+        app.rebuild_snarl();
+        app.selected = Some(0);
+        app.node_settings_open = true;
+        let toggle = |app: &mut App, parameter: InputParameter| {
+            render(&ctx, app, vec![]);
+            let output = render(&ctx, app, vec![]);
+            let pos = text_position(&output, &format!("{} from input", parameter.label()));
+            render(&ctx, app, vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)]);
+            render(&ctx, app, vec![pointer_button(pos, false)]);
+            render(&ctx, app, vec![]);
+        };
+        toggle(&mut app, InputParameter::Upper);
+        let port = app.graph.nodes[0].parameter_port(InputParameter::Upper).unwrap();
+        app.graph.connect_input(&upper, &target, port).unwrap();
+        app.rebuild_snarl();
+        toggle(&mut app, InputParameter::Lower);
+        let node = &app.graph.nodes[0];
+        assert_eq!(node.input_count(), 3);
+        assert!(app.graph.edges.iter().any(|edge| edge.source == upper
+            && Some(edge.input) == node.parameter_port(InputParameter::Upper)));
+        let port = node.parameter_port(InputParameter::Lower).unwrap();
+        app.graph.connect_input(&lower, &target, port).unwrap();
+        app.rebuild_snarl();
+        toggle(&mut app, InputParameter::Lower);
+        let node = &app.graph.nodes[0];
+        assert_eq!(node.input_count(), 2);
+        assert!(!app.graph.edges.iter().any(|edge| edge.source == lower));
+        assert!(app.graph.edges.iter().any(|edge| edge.source == main && edge.input == 0));
+        assert!(app.graph.edges.iter().any(|edge| edge.source == upper
+            && Some(edge.input) == node.parameter_port(InputParameter::Upper)));
+        assert_eq!(app.snarl.wires().count(), 2);
+        app.undo_edit(&ctx, false);
+        assert_eq!(app.graph.nodes[0].input_count(), 3);
+        assert_eq!(app.snarl.wires().count(), 3);
+        let restored = Graph::from_json(&app.graph.to_json()).unwrap();
+        assert_eq!(restored.nodes[0].input_parameters, app.graph.nodes[0].input_parameters);
+    }
+
+    #[test]
+    fn hysteresis_and_validation_offer_independent_setting_inputs_but_keyboard_does_not() {
+        for (kind, parameters) in [
+            (4, vec![InputParameter::Lower, InputParameter::Upper]),
+            (10, vec![InputParameter::Minimum, InputParameter::Maximum, InputParameter::MaxChange]),
+            (6, vec![]),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app();
+            app.kind = kind;
+            app.add_node();
+            app.selected = Some(0);
+            app.node_settings_open = true;
+            for parameter in &parameters {
+                render(&ctx, &mut app, vec![]);
+                let output = render(&ctx, &mut app, vec![]);
+                let pos = text_position(&output, &format!("{} from input", parameter.label()));
+                render(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)]);
+                render(&ctx, &mut app, vec![pointer_button(pos, false)]);
+            }
+            render(&ctx, &mut app, vec![]);
+            let output = render(&ctx, &mut app, vec![]);
+            assert_eq!(app.graph.nodes[0].input_count(), 1 + parameters.len());
+            if parameters.is_empty() {
+                assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text() == "Values from input pins")));
+            }
+        }
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> Pos2 {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label =>
+                Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        }).unwrap_or_else(|| panic!("Missing control or pin label: {label}"))
+    }
+
+    #[test]
     fn timer_event_runs_only_connected_branch_without_desktop_backend() {
         let ctx = egui::Context::default();
         let mut app = app();

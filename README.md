@@ -151,6 +151,22 @@ Hold **Shift** when starting to drag a node to duplicate it. The original stays 
 
 Each Compare Inputs port accepts one connection. Input assignments and constants are saved in the graph JSON; cached runtime values are not. Existing `[source, target]` edges still load as input A (port 0). Edges to input B use `{"source":"node1","target":"compare_inputs3","input":1}`.
 
+### Settings supplied by input pins
+
+Open node settings and use the independent checkboxes under **Values from input pins** to replace fixed values with connected inputs:
+
+- **Compare:** comparison value.
+- **Hysteresis / Threshold:** lower and upper thresholds.
+- **Numeric Validation:** minimum, maximum, and maximum absolute change.
+
+Each enabled option adds a labeled input pin accepting one connection. The first pin remains the main reading; connect a Constant, OCR/model output, or another value-producing node to a setting pin. Fixed editors are disabled while their pins are enabled, but retain their values for when you uncheck the option. Keyboard text and Constant values remain fixed settings.
+
+The node waits until the main reading and every enabled setting have supplied values. A changed setting re-evaluates the latest cached reading; sending the same setting again alone does not repeat the output. A fresh main reading is evaluated even if its value is unchanged. Existing comparison, crossing, hysteresis, and numeric-validation rules still control whether evaluation triggers an output.
+
+There is no fallback to fixed values for enabled pins. Missing or invalid settings block output without advancing crossing/accepted-reading state. Numeric settings must be finite numbers (plain numeric text is accepted), lower/minimum must not exceed upper/maximum, and maximum absolute change must be nonnegative. Runtime validation errors are logged.
+
+Changing the checkboxes stops automation. Other setting wires are preserved if pin positions shift; disabling a setting removes only its wire. Pin choices and connections are saved in JSON (`input_parameters`), support Undo/Redo, and are copied with node settings; cached readings are never saved. Older graphs keep their fixed-value behavior.
+
 Older JSON nodes tagged `"type": "threshold"` still load as **hysteresis**, preserving their behavior, names, and connections. They save with `"type": "hysteresis"`. New **threshold** nodes use `"type": "threshold_crossing"` in JSON to distinguish them from the legacy format.
 
 OCR can still misread a decimal point. Number conversion cannot recover a dot that OCR omitted and does not guess decimal placement. Check recognized text before connecting live actions.

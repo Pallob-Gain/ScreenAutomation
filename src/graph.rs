@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::node::{Kind, Node, Value};
+use crate::node::{InputParameter, Kind, Node, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -98,6 +98,25 @@ impl From<Edge> for SavedEdge {
     }
 }
 
+fn input_slots(
+    node: &Node,
+    parents: &[&Edge],
+    value_for: impl Fn(&Edge) -> Option<Value>,
+) -> Result<Vec<Option<Value>>, String> {
+    let mut slots = vec![None; node.input_count()];
+    let mut occupied = vec![false; slots.len()];
+    for edge in parents {
+        let slot = slots.get_mut(edge.input)
+            .ok_or_else(|| format!("{}: unknown input port", node.name))?;
+        if std::mem::replace(&mut occupied[edge.input], true) {
+            return Err(format!("{}: input '{}' has multiple connections",
+                node.name, node.input_label(edge.input)));
+        }
+        *slot = value_for(edge);
+    }
+    Ok(slots)
+}
+
 impl Graph {
     pub fn validate(&self) -> Vec<GraphIssue> {
         let mut issues = Vec::new();
@@ -122,10 +141,16 @@ impl Graph {
                 && node.region.map_or(true, |r| r.width == 0 || r.height == 0) {
                 add("region is missing or has zero size".into());
             }
+            if let Err(error) = node.validate_input_parameters() {
+                add(error);
+            }
+            let fixed = |parameter| node.parameter_port(parameter).is_none();
             match &node.kind {
                 Kind::Threshold { lower, upper, trigger, .. } | Kind::Hysteresis { lower, upper, trigger, .. } => {
-                    if !lower.is_finite() || !upper.is_finite() || lower > upper
-                        || (lower == upper && matches!(trigger, crate::node::Crossing::EnteringRange)) {
+                    use InputParameter::{Lower, Upper};
+                    if (fixed(Lower) && !lower.is_finite()) || (fixed(Upper) && !upper.is_finite())
+                        || (fixed(Lower) && fixed(Upper) && (lower > upper
+                            || (lower == upper && matches!(trigger, crate::node::Crossing::EnteringRange)))) {
                         add("invalid or impossible threshold range".into());
                     }
                     if matches!(node.kind, Kind::Hysteresis { .. }) && trigger.is_range() {
@@ -133,9 +158,12 @@ impl Graph {
                     }
                 }
                 Kind::ValidateNumber { minimum, maximum, max_change, pattern, .. } => {
-                    if minimum.is_some_and(|v| !v.is_finite()) || maximum.is_some_and(|v| !v.is_finite())
-                        || max_change.is_some_and(|v| !v.is_finite() || v < 0.0)
-                        || matches!((minimum, maximum), (Some(min), Some(max)) if min > max) {
+                    use InputParameter::{Minimum, Maximum, MaxChange};
+                    if (fixed(Minimum) && minimum.is_some_and(|v| !v.is_finite()))
+                        || (fixed(Maximum) && maximum.is_some_and(|v| !v.is_finite()))
+                        || (fixed(MaxChange) && max_change.is_some_and(|v| !v.is_finite() || v < 0.0))
+                        || (fixed(Minimum) && fixed(Maximum)
+                            && matches!((minimum, maximum), (Some(min), Some(max)) if min > max)) {
                         add("invalid numeric range or maximum change".into());
                     }
                     if !pattern.is_empty() {
@@ -198,9 +226,9 @@ impl Graph {
             if target.is_some_and(|n| edge.input >= n.input_count()) {
                 issues.push(GraphIssue { node: Some(edge.target.clone()), message: "unknown input port".into() });
             }
-            if target.is_some_and(|n| matches!(n.kind, Kind::CompareInputs { .. }))
+            if target.is_some_and(Node::has_single_connection_ports)
                 && !occupied.insert((&edge.target, edge.input)) {
-                issues.push(GraphIssue { node: Some(edge.target.clone()), message: "comparison input has multiple connections".into() });
+                issues.push(GraphIssue { node: Some(edge.target.clone()), message: format!("input port {} has multiple connections", edge.input) });
             }
         }
         if let Err(error) = self.order() {
@@ -234,21 +262,57 @@ impl Graph {
         self.connect_input(src, dst, 0)
     }
 
+    pub fn set_parameter_input(
+        &mut self, node: &str, parameter: InputParameter, enabled: bool,
+    ) -> Result<(), String> {
+        let target = self.nodes.iter_mut().find(|n| n.name == node).ok_or("unknown node")?;
+        let available = target.available_input_parameters();
+        if !available.contains(&parameter) {
+            return Err(format!("Unsupported input parameter '{}'", parameter.label()));
+        }
+        target.validate_input_parameters()?;
+        let previous = &target.input_parameters;
+        let next: Vec<_> = available.iter().copied()
+            .filter(|&p| if p == parameter { enabled } else { previous.contains(&p) })
+            .collect();
+        if *previous == next {
+            return Ok(());
+        }
+        if !next.is_empty() && self.edges.iter()
+            .filter(|edge| edge.target == node && edge.input == 0).take(2).count() > 1 {
+            return Err("Main input has multiple connections".into());
+        }
+        self.edges.retain_mut(|edge| {
+            if edge.target != node || edge.input == 0 {
+                return true;
+            }
+            let Some(port) = previous.get(edge.input - 1)
+                .and_then(|p| next.iter().position(|q| q == p)) else { return false };
+            edge.input = port + 1;
+            true
+        });
+        target.input_parameters = next;
+        target.reset_runtime();
+        Ok(())
+    }
+
     pub fn connect_input(&mut self, src: &str, dst: &str, input: usize) -> Result<(), String> {
         if !self.nodes.iter().any(|n| n.name == src) {
             return Err("unknown node".into());
         }
         let destination = self.nodes.iter().position(|node| node.name == dst)
             .ok_or("unknown node")?;
-        let pair = matches!(self.nodes[destination].kind, crate::node::Kind::CompareInputs { .. });
-        if input >= if pair { 2 } else { 1 } {
+        let target = &self.nodes[destination];
+        // Keep accepting legacy port-zero edges to source nodes; validation flags them.
+        if input >= target.input_count().max(1) {
             return Err("unknown input port".into());
+        }
+        if target.has_single_connection_ports()
+            && self.edges.iter().any(|edge| edge.target == dst && edge.input == input) {
+            return Err(format!("Input {} already has a connection", target.input_label(input)));
         }
         let e = Edge { source: src.into(), target: dst.into(), input };
         if !self.edges.contains(&e) {
-            if pair && self.edges.iter().any(|edge| edge.target == dst && edge.input == input) {
-                return Err(format!("Input {} already has a connection", if input == 0 { "A" } else { "B" }));
-            }
             self.edges.push(e);
             self.nodes[destination].reset_input_state();
         }
@@ -342,23 +406,21 @@ impl Graph {
     ) -> Result<(Vec<Value>, Option<Value>), String> {
         let name = self.nodes[i].name.clone();
         let parents: Vec<&Edge> = self.edges.iter().filter(|edge| edge.target == name).collect();
-        let inputs: Vec<Value> = if matches!(self.nodes[i].kind, Kind::CompareInputs { .. }) {
-            let mut ordered = parents.clone();
-            ordered.sort_by_key(|edge| edge.input);
-            ordered.iter().filter_map(|edge| outputs.get(&edge.source).cloned().flatten()).collect()
+        let value_for = |edge: &Edge| outputs.get(&edge.source).cloned().flatten();
+        let slots = if self.nodes[i].has_single_connection_ports() {
+            Some(input_slots(&self.nodes[i], &parents, value_for)?)
         } else {
-            parents.iter().filter_map(|edge| outputs.get(&edge.source).cloned().flatten()).collect()
+            None
+        };
+        let inputs: Vec<Value> = match &slots {
+            Some(slots) => slots.iter().flatten().cloned().collect(),
+            None => parents.iter().filter_map(|edge| value_for(edge)).collect(),
         };
         let result = if matches!(self.nodes[i].kind, Kind::SubflowInput) {
             injected.cloned()
-        } else if matches!(self.nodes[i].kind, Kind::CompareInputs { .. }) {
-            let mut slots = [None, None];
-            for edge in &parents {
-                let slot = slots.get_mut(edge.input).ok_or_else(|| format!("{name}: unknown comparison input port"))?;
-                *slot = outputs.get(&edge.source).cloned().flatten();
-            }
-            if slots.iter().any(Option::is_some) {
-                self.nodes[i].process_slots(&slots, backend).map_err(|e| format!("{name}: {e}"))?
+        } else if let Some(slots) = slots {
+            if !inputs.is_empty() {
+                self.nodes[i].process_slots(&slots, true, backend, depth).map_err(|e| format!("{name}: {e}"))?
             } else { None }
         } else if !parents.is_empty() && inputs.is_empty() {
             None
@@ -418,6 +480,7 @@ impl Graph {
         for event in events {
             runtime.values.insert(event.source.clone(), event.value.clone());
         }
+        let mut context_outputs = HashMap::new();
         for index in order {
             let name = self.nodes[index].name.clone();
             if outputs.contains_key(&name) || !needed.contains(&name) {
@@ -439,14 +502,23 @@ impl Graph {
                 outputs.get(&edge.source).cloned()
                     .unwrap_or_else(|| runtime.values.get(&edge.source).cloned())
             };
-            let out = if matches!(self.nodes[index].kind, Kind::CompareInputs { .. }) {
-                let mut inputs = [None, None];
-                for edge in &parents {
-                    let slot = inputs.get_mut(edge.input).ok_or("Unknown comparison input port")?;
-                    *slot = value_for(edge);
-                }
+            let out = if self.nodes[index].has_single_connection_ports() {
+                let node = &self.nodes[index];
+                let dynamic = !node.input_parameters.is_empty();
+                // Only events/propagated outputs are fresh main samples. Context can
+                // seed a main input and supply settings, but cannot replay a reading.
+                let main_is_fresh = parents.iter().any(|edge| edge.input == 0
+                    && outputs.get(&edge.source).is_some_and(Option::is_some));
+                let inputs = input_slots(node, &parents, |edge| {
+                    if dynamic {
+                        outputs.get(&edge.source).or_else(|| context_outputs.get(&edge.source))
+                            .cloned().flatten()
+                    } else {
+                        value_for(edge)
+                    }
+                })?;
                 if inputs.iter().any(Option::is_some) {
-                    self.nodes[index].process_slots(&inputs, backend)?
+                    self.nodes[index].process_slots(&inputs, main_is_fresh, backend, 0)?
                 } else {
                     None
                 }
@@ -463,6 +535,8 @@ impl Graph {
             }
             if triggered {
                 outputs.insert(name, out);
+            } else {
+                context_outputs.insert(name, out);
             }
         }
         Ok(outputs)
@@ -470,21 +544,32 @@ impl Graph {
 
     pub fn from_json(s: &str) -> Result<Graph, String> {
         let graph: Graph = serde_json::from_str(s).map_err(|e| e.to_string())?;
-        let mut occupied = HashSet::new();
-        for edge in &graph.edges {
-            if !graph.nodes.iter().any(|node| node.name == edge.source) {
-                return Err(format!("unknown node: {}", edge.source));
-            }
-            let node = graph.nodes.iter().find(|node| node.name == edge.target)
-                .ok_or_else(|| format!("unknown node: {}", edge.target))?;
-            let pair = matches!(node.kind, crate::node::Kind::CompareInputs { .. });
-            if edge.input >= if pair { 2 } else { 1 } {
-                return Err("unknown input port".into());
-            }
-            if pair && !occupied.insert((&edge.target, edge.input)) {
-                return Err("comparison input has more than one connection".into());
+        graph.validate_saved_routing()?;
+        Ok(graph)
+    }
+
+    fn validate_saved_routing(&self) -> Result<(), String> {
+        for node in &self.nodes {
+            node.validate_input_parameters().map_err(|error| format!("{}: {error}", node.name))?;
+            if let Kind::Subflow { graph } = &node.kind {
+                graph.validate_saved_routing()?;
             }
         }
-        Ok(graph)
+        let mut occupied = HashSet::new();
+        for edge in &self.edges {
+            if !self.nodes.iter().any(|node| node.name == edge.source) {
+                return Err(format!("unknown node: {}", edge.source));
+            }
+            let node = self.nodes.iter().find(|node| node.name == edge.target)
+                .ok_or_else(|| format!("unknown node: {}", edge.target))?;
+            if edge.input >= node.input_count().max(1) {
+                return Err("unknown input port".into());
+            }
+            if node.has_single_connection_ports() && !occupied.insert((&edge.target, edge.input)) {
+                return Err(format!("{}: input '{}' has more than one connection",
+                    node.name, node.input_label(edge.input)));
+            }
+        }
+        Ok(())
     }
 }

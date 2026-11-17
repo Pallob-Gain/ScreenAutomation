@@ -15,6 +15,30 @@ pub enum Value {
     Text(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputParameter {
+    CompareValue,
+    Lower,
+    Upper,
+    Minimum,
+    Maximum,
+    MaxChange,
+}
+
+impl InputParameter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CompareValue => "Value",
+            Self::Lower => "Lower",
+            Self::Upper => "Upper",
+            Self::Minimum => "Minimum",
+            Self::Maximum => "Maximum",
+            Self::MaxChange => "Max change",
+        }
+    }
+}
+
 impl Value {
     pub fn to_text(&self) -> String {
         match self {
@@ -271,6 +295,10 @@ pub struct Node {
     pub group: String,
     #[serde(flatten)]
     pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_parameters: Vec<InputParameter>,
+    #[serde(skip)]
+    parameter_values: Vec<Option<Value>>,
     #[serde(default)]
     pub position: [f32; 2],
     #[serde(default)]
@@ -290,6 +318,8 @@ impl Node {
             title: String::new(),
             group: String::new(),
             kind,
+            input_parameters: Vec::new(),
+            parameter_values: Vec::new(),
             position: [0.0, 0.0],
             region: has_region.then(Region::default),
             color: [0, 170, 255],
@@ -306,6 +336,7 @@ impl Node {
     }
 
     pub(crate) fn reset_runtime(&mut self) {
+        self.parameter_values.clear();
         match &mut self.kind {
             Kind::Ocr { last_hash, .. } => *last_hash = None,
             Kind::Compare { last, .. } => *last = None,
@@ -325,8 +356,48 @@ impl Node {
             Kind::Ocr { .. } | Kind::Constant { .. } | Kind::Event { .. }
             | Kind::Note { .. } | Kind::SubflowInput => 0,
             Kind::CompareInputs { .. } => 2,
+            _ if !self.available_input_parameters().is_empty() => 1 + self.input_parameters.len(),
             _ => 1,
         }
+    }
+
+    pub fn available_input_parameters(&self) -> &'static [InputParameter] {
+        use InputParameter::*;
+        match self.kind {
+            Kind::Compare { .. } => &[CompareValue],
+            Kind::Hysteresis { .. } | Kind::Threshold { .. } => &[Lower, Upper],
+            Kind::ValidateNumber { .. } => &[Minimum, Maximum, MaxChange],
+            _ => &[],
+        }
+    }
+
+    pub fn parameter_port(&self, parameter: InputParameter) -> Option<usize> {
+        self.input_parameters.iter().position(|&p| p == parameter).map(|p| p + 1)
+    }
+
+    pub fn input_label(&self, port: usize) -> &'static str {
+        match (port, &self.kind) {
+            (0, Kind::CompareInputs { .. }) => "A",
+            (1, Kind::CompareInputs { .. }) => "B",
+            (0, _) => "Input",
+            (port, _) => self.input_parameters.get(port - 1).map_or("Input", |p| p.label()),
+        }
+    }
+
+    pub(crate) fn validate_input_parameters(&self) -> Result<(), String> {
+        for (i, parameter) in self.input_parameters.iter().enumerate() {
+            if !self.available_input_parameters().contains(parameter) {
+                return Err(format!("unsupported input parameter '{}'", parameter.label()));
+            }
+            if self.input_parameters[..i].contains(parameter) {
+                return Err(format!("duplicate input parameter '{}'", parameter.label()));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_single_connection_ports(&self) -> bool {
+        !self.input_parameters.is_empty() || matches!(self.kind, Kind::CompareInputs { .. })
     }
 
     pub fn output_count(&self) -> usize {
@@ -366,6 +437,10 @@ impl Node {
     }
 
     pub(crate) fn reset_input_state(&mut self) {
+        if !self.input_parameters.is_empty() {
+            self.reset_runtime();
+            return;
+        }
         match &mut self.kind {
             Kind::CompareInputs { values, last, .. } => {
                 *values = [None, None];
@@ -378,8 +453,10 @@ impl Node {
 
     pub(crate) fn process_slots(
         &mut self,
-        inputs: &[Option<Value>; 2],
+        inputs: &[Option<Value>],
+        main_is_fresh: bool,
         backend: &mut dyn Backend,
+        depth: usize,
     ) -> Result<Option<Value>, String> {
         if let Kind::CompareInputs { values, .. } = &mut self.kind {
             for (cached, incoming) in values.iter_mut().zip(inputs) {
@@ -387,8 +464,32 @@ impl Node {
                     *cached = Some(value.clone());
                 }
             }
+            return self.evaluate(&[], backend, depth);
         }
-        self.process(&[], backend)
+
+        self.validate_input_parameters()?;
+        self.parameter_values.resize(self.input_count(), None);
+        let mut changed = false;
+        for (port, (cached, incoming)) in self.parameter_values.iter_mut().zip(inputs).enumerate() {
+            if let Some(value) = incoming {
+                if port == 0 && !main_is_fresh && cached.is_some() {
+                    continue;
+                }
+                if (port == 0 && main_is_fresh) || cached.as_ref() != Some(value) {
+                    *cached = Some(value.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let Some(main) = self.parameter_values[0].clone() else { return Ok(None) };
+        if let Some(port) = self.parameter_values.iter().position(Option::is_none) {
+            log::warn!("[{}] Waiting for input '{}'", self.name, self.input_label(port));
+            return Ok(None);
+        }
+        self.evaluate(&[main], backend, depth)
     }
 
     /// Recognizes an already captured event frame without taking another screenshot.
@@ -420,6 +521,30 @@ impl Node {
         backend: &mut dyn Backend,
         depth: usize,
     ) -> Result<Option<Value>, String> {
+        if !self.input_parameters.is_empty() {
+            let slots: Vec<_> = inputs.iter().cloned().map(Some).collect();
+            return self.process_slots(&slots, true, backend, depth);
+        }
+        self.evaluate(inputs, backend, depth)
+    }
+
+    fn evaluate(
+        &mut self,
+        inputs: &[Value],
+        backend: &mut dyn Backend,
+        depth: usize,
+    ) -> Result<Option<Value>, String> {
+        use InputParameter::*;
+        let parameter = |p| {
+            self.input_parameters.iter().position(|&enabled| enabled == p)
+                .map(|index| self.parameter_values[index + 1].as_ref().expect("settings are ready"))
+        };
+        let limit = |p: InputParameter, fixed| match parameter(p) {
+            None => Ok(fixed),
+            Some(value) => strict_number(value).filter(|n| n.is_finite()).map(Some).ok_or_else(|| {
+                log::warn!("[{}] '{}' must be a finite number", self.name, p.label());
+            }),
+        };
         let region = self.region.unwrap_or_default();
         let hysteresis = matches!(self.kind, Kind::Hysteresis { .. });
         match &mut self.kind {
@@ -449,6 +574,13 @@ impl Node {
                 let Some(input) = inputs.first() else {
                     return Ok(None);
                 };
+                let target = parameter(CompareValue);
+                if matches!(target, Some(Value::Num(n)) if !n.is_finite()) {
+                    log::warn!("[{}] Comparison value must be finite", self.name);
+                    return Ok(None);
+                }
+                let dynamic_value = target.map(Value::to_text);
+                let value = dynamic_value.as_deref().unwrap_or(value);
                 let Some(result) = op.test(input, value) else {
                     log::warn!(
                         "[COMPARE] Cannot compare '{}' {} '{}'",
@@ -503,8 +635,13 @@ impl Node {
                 let Some(input) = inputs.first() else {
                     return Ok(None);
                 };
-                if !lower.is_finite() || !upper.is_finite() || lower > upper {
-                    log::warn!("[{label}] Thresholds must be finite and lower <= upper");
+                let (Ok(Some(lower)), Ok(Some(upper))) =
+                    (limit(Lower, Some(*lower)), limit(Upper, Some(*upper))) else {
+                    return Ok(None);
+                };
+                if !lower.is_finite() || !upper.is_finite() || lower > upper
+                    || (lower == upper && *trigger == Crossing::EnteringRange) {
+                    log::warn!("[{label}] Invalid or impossible threshold range");
                     return Ok(None);
                 }
                 let Some(v) = as_number(input) else {
@@ -519,12 +656,12 @@ impl Node {
                     return Err("Range-entry triggers are only supported by Threshold nodes".into());
                 }
                 let previous = *band;
-                let current = if v > *upper
-                    || (matches!(*trigger, Crossing::RisingOrEqual | Crossing::EnteringRange) && v == *upper)
+                let current = if v > upper
+                    || (matches!(*trigger, Crossing::RisingOrEqual | Crossing::EnteringRange) && v == upper)
                 {
                     Band::Above
-                } else if v < *lower
-                    || (matches!(*trigger, Crossing::FallingOrEqual | Crossing::EnteringRange) && v == *lower)
+                } else if v < lower
+                    || (matches!(*trigger, Crossing::FallingOrEqual | Crossing::EnteringRange) && v == lower)
                 {
                     Band::Below
                 } else if hysteresis {
@@ -592,21 +729,26 @@ impl Node {
             }
             Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
                 let Some(input) = inputs.first() else { return Ok(None) };
-                let text = input.to_text();
-                let number = match input {
-                    Value::Int(n) => Some(*n as f64),
-                    Value::Num(n) => Some(*n),
-                    Value::Text(s) => s.trim().parse::<f64>().ok(),
-                    Value::Bool(_) => None,
+                let (Ok(minimum), Ok(maximum), Ok(max_change)) =
+                    (limit(Minimum, *minimum), limit(Maximum, *maximum), limit(MaxChange, *max_change)) else {
+                    return Ok(None);
                 };
+                if minimum.is_some_and(|v| !v.is_finite()) || maximum.is_some_and(|v| !v.is_finite())
+                    || max_change.is_some_and(|v| !v.is_finite() || v < 0.0)
+                    || matches!((minimum, maximum), (Some(min), Some(max)) if min > max)
+                {
+                    log::warn!("[VALIDATE NUMBER] Invalid limits at node '{}'", self.name);
+                    return Ok(None);
+                }
+                let text = input.to_text();
+                let number = strict_number(input);
                 let regex_ok = pattern.is_empty() || regex::Regex::new(pattern)
                     .map(|regex| regex.is_match(&text)).unwrap_or(false);
                 let accepted = number.filter(|n| n.is_finite()
                     && regex_ok
-                    && minimum.map_or(true, |v| v.is_finite() && *n >= v)
-                    && maximum.map_or(true, |v| v.is_finite() && *n <= v)
-                    && max_change.map_or(true, |v| v.is_finite() && v >= 0.0
-                        && last.map_or(true, |previous| (*n - previous).abs() <= v)));
+                    && minimum.map_or(true, |v| *n >= v)
+                    && maximum.map_or(true, |v| *n <= v)
+                    && max_change.map_or(true, |v| last.map_or(true, |previous| (*n - previous).abs() <= v)));
                 if let Some(number) = accepted {
                     *last = Some(number);
                     Ok(Some(input.clone()))
@@ -624,6 +766,15 @@ impl Node {
                 graph.run_subflow(inputs.first().cloned(), backend, depth + 1)
             }
         }
+    }
+}
+
+fn strict_number(input: &Value) -> Option<f64> {
+    match input {
+        Value::Int(n) => Some(*n as f64),
+        Value::Num(n) => Some(*n),
+        Value::Text(s) => s.trim().parse().ok(),
+        Value::Bool(_) => None,
     }
 }
 

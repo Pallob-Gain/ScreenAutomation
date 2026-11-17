@@ -2,11 +2,12 @@
   "nodes": [
     {
       "name": "ocr1",
+      "title": "Value",
       "type": "ocr",
       "single_line": true,
       "position": [
-        80.0,
-        80.0
+        -51.104744,
+        87.70838
       ],
       "region": {
         "x": 761,
@@ -42,14 +43,14 @@
       "type": "click",
       "button": "left",
       "position": [
-        525.6,
-        93.99999
+        776.1628,
+        79.25521
       ],
       "region": {
-        "x": 764,
-        "y": 583,
-        "width": 158,
-        "height": 60
+        "x": 772,
+        "y": 618,
+        "width": 133,
+        "height": 51
       },
       "color": [
         0,
@@ -63,14 +64,14 @@
       "type": "click",
       "button": "left",
       "position": [
-        528.0,
-        181.2
+        783.78516,
+        286.56635
       ],
       "region": {
-        "x": 760,
-        "y": 677,
-        "width": 158,
-        "height": 60
+        "x": 766,
+        "y": 718,
+        "width": 150,
+        "height": 36
       },
       "color": [
         0,
@@ -85,9 +86,13 @@
       "upper": 100.014,
       "lower": 99.914,
       "trigger": "rising",
+      "input_parameters": [
+        "lower",
+        "upper"
+      ],
       "position": [
-        264.0,
-        94.0
+        432.05276,
+        92.832985
       ],
       "region": null,
       "color": [
@@ -103,9 +108,89 @@
       "upper": 100.014,
       "lower": 99.914,
       "trigger": "falling",
+      "input_parameters": [
+        "lower",
+        "upper"
+      ],
       "position": [
-        260.8,
-        190.79999
+        465.40836,
+        295.12195
+      ],
+      "region": null,
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "ocr7",
+      "title": "Upper",
+      "type": "ocr",
+      "single_line": false,
+      "position": [
+        -42.538338,
+        -102.5097
+      ],
+      "region": {
+        "x": 1271,
+        "y": 240,
+        "width": 150,
+        "height": 22
+      },
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "ocr8",
+      "title": "Lower",
+      "type": "ocr",
+      "single_line": false,
+      "position": [
+        -44.960278,
+        -28.986551
+      ],
+      "region": {
+        "x": 1270,
+        "y": 279,
+        "width": 149,
+        "height": 26
+      },
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "model9",
+      "type": "model",
+      "format": "number",
+      "position": [
+        117.51432,
+        -102.02621
+      ],
+      "region": null,
+      "color": [
+        0,
+        170,
+        255
+      ],
+      "opacity": 0.3
+    },
+    {
+      "name": "model10",
+      "type": "model",
+      "format": "number",
+      "position": [
+        118.681366,
+        -28.503166
       ],
       "region": null,
       "color": [
@@ -136,7 +221,35 @@
     [
       "threshold6",
       "click6"
-    ]
+    ],
+    [
+      "ocr7",
+      "model9"
+    ],
+    [
+      "ocr8",
+      "model10"
+    ],
+    {
+      "source": "model10",
+      "target": "threshold5",
+      "input": 1
+    },
+    {
+      "source": "model10",
+      "target": "threshold6",
+      "input": 1
+    },
+    {
+      "source": "model9",
+      "target": "threshold5",
+      "input": 2
+    },
+    {
+      "source": "model9",
+      "target": "threshold6",
+      "input": 2
+    }
   ],
   "settings": {
     "run_mode": "hmi_event",

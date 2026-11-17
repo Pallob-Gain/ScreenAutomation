@@ -10,7 +10,7 @@ use screen_automation::{
     backend::{Backend, Region},
     desktop::Desktop,
     graph::{EventRuntime, Graph, GraphSettings, NodeEvent, RunMode, DEFAULT_REFRESH_MS},
-    node::{CompareOp, Crossing, Format, Kind, Node, Value},
+    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, Value},
     session_log::SessionLog,
     screen_events::{ScreenEvents, ScreenRegion},
     event_sources::{EventRegistration, EventSource, EventSources},
@@ -361,7 +361,10 @@ fn node_style(kind: &Kind) -> (Color32, &'static str) {
 fn node_label(node: &Node) -> String {
     let title = node.display_title();
     match &node.kind {
-        Kind::Compare { op, value, .. } => format!("{title}  {} {value}", op.symbol()),
+        Kind::Compare { op, value, .. } => {
+            let value = parameter_text(node, InputParameter::CompareValue, value);
+            format!("{title}  {} {value}", op.symbol())
+        }
         Kind::CompareInputs { op, .. } => format!("{title}  A {} B", op.symbol()),
         Kind::Constant { value, .. } => format!("{title}  = {value}"),
         Kind::Hysteresis {
@@ -374,14 +377,18 @@ fn node_label(node: &Node) -> String {
             lower,
             trigger,
             ..
-        } => match trigger {
-            Crossing::Rising => format!("{title}  ↑ {upper}"),
-            Crossing::RisingOrEqual => format!("{title}  ≥ {upper}"),
-            Crossing::Falling => format!("{title}  ↓ {lower}"),
-            Crossing::FallingOrEqual => format!("{title}  ≤ {lower}"),
-            Crossing::Both => format!("{title}  ↑ {upper} ↓ {lower}"),
-            Crossing::EnteringRange => format!("{title}  ({lower}, {upper})"),
-            Crossing::EnteringRangeInclusive => format!("{title}  [{lower}, {upper}]"),
+        } => {
+            let upper = parameter_text(node, InputParameter::Upper, upper);
+            let lower = parameter_text(node, InputParameter::Lower, lower);
+            match trigger {
+                Crossing::Rising => format!("{title}  ↑ {upper}"),
+                Crossing::RisingOrEqual => format!("{title}  ≥ {upper}"),
+                Crossing::Falling => format!("{title}  ↓ {lower}"),
+                Crossing::FallingOrEqual => format!("{title}  ≤ {lower}"),
+                Crossing::Both => format!("{title}  ↑ {upper} ↓ {lower}"),
+                Crossing::EnteringRange => format!("{title}  ({lower}, {upper})"),
+                Crossing::EnteringRangeInclusive => format!("{title}  [{lower}, {upper}]"),
+            }
         },
         _ => title.to_owned(),
     }
@@ -398,7 +405,10 @@ fn node_description(node: &Node) -> String {
         }
         .into(),
         Kind::Function { .. } => "Evaluate a Rhai expression".into(),
-        Kind::Compare { op, value, .. } => format!("Trigger if input {} {value}", op.symbol()),
+        Kind::Compare { op, value, .. } => {
+            let value = parameter_text(node, InputParameter::CompareValue, value);
+            format!("Trigger if input {} {value}", op.symbol())
+        }
         Kind::CompareInputs { op, trigger_when, .. } =>
             format!("Compare A {} B; trigger when {trigger_when}", op.symbol()),
         Kind::Constant { value, format } => format!("Output {value:?} as {format:?} each tick"),
@@ -412,16 +422,20 @@ fn node_description(node: &Node) -> String {
             lower,
             trigger,
             ..
-        } => match trigger {
-            Crossing::Rising => format!("Trigger when input rises above {upper}"),
-            Crossing::RisingOrEqual => format!("Trigger when input rises to or above {upper}"),
-            Crossing::Falling => format!("Trigger when input falls below {lower}"),
-            Crossing::FallingOrEqual => format!("Trigger when input falls to or below {lower}"),
-            Crossing::Both => {
-                format!("Trigger when input rises above {upper} or falls below {lower}")
+        } => {
+            let upper = parameter_text(node, InputParameter::Upper, upper);
+            let lower = parameter_text(node, InputParameter::Lower, lower);
+            match trigger {
+                Crossing::Rising => format!("Trigger when input rises above {upper}"),
+                Crossing::RisingOrEqual => format!("Trigger when input rises to or above {upper}"),
+                Crossing::Falling => format!("Trigger when input falls below {lower}"),
+                Crossing::FallingOrEqual => format!("Trigger when input falls to or below {lower}"),
+                Crossing::Both => {
+                    format!("Trigger when input rises above {upper} or falls below {lower}")
+                }
+                Crossing::EnteringRange => format!("Trigger on entering {lower} < value < {upper}"),
+                Crossing::EnteringRangeInclusive => format!("Trigger on entering {lower} <= value <= {upper}"),
             }
-            Crossing::EnteringRange => format!("Trigger on entering {lower} < value < {upper}"),
-            Crossing::EnteringRangeInclusive => format!("Trigger on entering {lower} <= value <= {upper}"),
         },
         Kind::Keyboard { .. } => "Type text into a screen region".into(),
         Kind::Click { .. } => "Click a screen region".into(),
@@ -431,6 +445,14 @@ fn node_description(node: &Node) -> String {
         Kind::Subflow { graph } => format!("Embedded reusable workflow ({} nodes)", graph.nodes.len()),
         Kind::SubflowInput => "Input value supplied by the containing subflow".into(),
         Kind::SubflowOutput => "Return a value from the containing subflow".into(),
+    }
+}
+
+fn parameter_text(node: &Node, parameter: InputParameter, fixed: impl ToString) -> String {
+    if node.parameter_port(parameter).is_some() {
+        format!("{} input", parameter.label())
+    } else {
+        fixed.to_string()
     }
 }
 
@@ -738,14 +760,15 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
             egui::FontId::proportional(14.0),
             NODE_TEXT,
         );
-        let width = (NODE_ICON_WIDTH + label.size().x + 24.0).max(NODE_MIN_WIDTH);
+        let icon_width = node_icon_width(ui.painter(), node);
+        let width = (icon_width + label.size().x + 24.0).max(NODE_MIN_WIDTH);
         let height = NODE_HEIGHT * inputs.len().max(1) as f32;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
         let painter = ui.painter();
 
         let radius = NODE_RADIUS;
         let icon_rect =
-            egui::Rect::from_min_size(rect.min, egui::vec2(NODE_ICON_WIDTH, rect.height()));
+            egui::Rect::from_min_size(rect.min, egui::vec2(icon_width, rect.height()));
         painter.rect_filled(
             icon_rect,
             egui::CornerRadius { nw: radius, sw: radius, ne: 0, se: 0 },
@@ -757,7 +780,7 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
             egui::Stroke::new(1.0, Color32::from_black_alpha(30)),
         );
         painter.text(
-            icon_rect.center(),
+            egui::pos2(icon_rect.right() - NODE_ICON_WIDTH / 2.0, icon_rect.center().y),
             egui::Align2::CENTER_CENTER,
             icon,
             egui::FontId::proportional(16.0),
@@ -788,11 +811,11 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
                 egui::Stroke::new(1.0, PIN_STROKE),
                 egui::StrokeKind::Inside,
             );
-            if inputs.len() == 2 {
+            if inputs.len() > 1 {
                 painter.text(
                     egui::pos2(rect.left() + 8.0, y),
                     egui::Align2::LEFT_CENTER,
-                    if input == 0 { "A" } else { "B" },
+                    node.input_label(input),
                     egui::FontId::proportional(11.0),
                     NODE_TEXT,
                 );
@@ -925,8 +948,19 @@ fn canvas_node_size(painter: &egui::Painter, node: &Node) -> egui::Vec2 {
         return egui::vec2(260.0, text.size().y + 40.0);
     }
     let label = painter.layout_no_wrap(node_label(node), font, NODE_TEXT);
-    egui::vec2((NODE_ICON_WIDTH + label.size().x + 24.0).max(NODE_MIN_WIDTH) + 10.0,
+    egui::vec2((node_icon_width(painter, node) + label.size().x + 24.0).max(NODE_MIN_WIDTH) + 10.0,
         NODE_HEIGHT * node.input_count().max(1) as f32 + 10.0)
+}
+
+fn node_icon_width(painter: &egui::Painter, node: &Node) -> f32 {
+    if node.input_parameters.is_empty() {
+        NODE_ICON_WIDTH
+    } else {
+        let labels = (0..node.input_count()).map(|port| {
+            painter.layout_no_wrap(node.input_label(port).to_owned(), egui::FontId::proportional(11.0), NODE_TEXT).size().x
+        }).fold(0.0, f32::max);
+        NODE_ICON_WIDTH + labels + 16.0
+    }
 }
 
 impl App {
@@ -1484,7 +1518,7 @@ impl App {
         }
         let definition = serde_json::to_string(&(
             &self.graph.edges,
-            self.graph.nodes.iter().map(|node| (&node.name, &node.kind)).collect::<Vec<_>>(),
+            self.graph.nodes.iter().map(|node| (&node.name, &node.kind, &node.input_parameters)).collect::<Vec<_>>(),
         )).map_err(|error| error.to_string())?;
         if (self.screen_events.is_some() || self.extra_events.is_some())
             && (self.event_regions != regions || self.event_definition != definition)
@@ -1575,6 +1609,7 @@ impl App {
         };
         let mut open = true;
         let mut delete = false;
+        let mut parameter_changes = Vec::new();
         let popup_clicked = egui::Popup::is_any_open(ctx)
             && ctx.pointer_interact_pos()
                 .and_then(|pos| ctx.layer_id_at(pos))
@@ -1598,6 +1633,20 @@ impl App {
                     ui.text_edit_singleline(&mut node.group);
                 });
                 settings.separator();
+                if !node.available_input_parameters().is_empty() {
+                    settings.label("Values from input pins");
+                    for &parameter in node.available_input_parameters() {
+                        let mut enabled = node.parameter_port(parameter).is_some();
+                        if settings.checkbox(&mut enabled, format!("{} from input", parameter.label())).changed() {
+                            parameter_changes.push((parameter, enabled));
+                        }
+                    }
+                    if !node.input_parameters.is_empty() {
+                        settings.weak("Connect each enabled setting. Waits for all values, then re-evaluates the latest reading when a setting changes. Fixed values below are retained but not used for connected settings.");
+                    }
+                    settings.separator();
+                }
+                let parameters = node.input_parameters.clone();
                 let hysteresis = matches!(node.kind, Kind::Hysteresis { .. });
                 match &mut node.kind {
                     Kind::Model { format } => {
@@ -1637,7 +1686,11 @@ impl App {
                                 }
                             });
                         settings.label("Value");
-                        settings.text_edit_singleline(value);
+                        settings.add_enabled(
+                            !parameters.contains(&InputParameter::CompareValue),
+                            egui::TextEdit::singleline(value)
+                                .id(Id::new(("fixed-parameter", index, InputParameter::CompareValue.label()))),
+                        );
                         settings.checkbox(on_change, "Only trigger when the condition becomes true");
                         settings.weak(
                             "Numbers are read from the input text. When the condition holds, \
@@ -1694,13 +1747,16 @@ impl App {
                             });
                         egui::Grid::new("threshold-values").show(settings, |ui| {
                             ui.label("Upper threshold");
-                            ui.add(egui::DragValue::new(upper).speed(0.01).max_decimals(6));
+                            ui.add_enabled(!parameters.contains(&InputParameter::Upper),
+                                egui::DragValue::new(upper).speed(0.01).max_decimals(6));
                             ui.end_row();
                             ui.label("Lower threshold");
-                            ui.add(egui::DragValue::new(lower).speed(0.01).max_decimals(6));
+                            ui.add_enabled(!parameters.contains(&InputParameter::Lower),
+                                egui::DragValue::new(lower).speed(0.01).max_decimals(6));
                             ui.end_row();
                         });
-                        if lower > upper {
+                        if !parameters.contains(&InputParameter::Lower)
+                            && !parameters.contains(&InputParameter::Upper) && lower > upper {
                             settings.colored_label(
                                 settings.visuals().error_fg_color,
                                 "Lower threshold must not be above the upper threshold.",
@@ -1752,9 +1808,9 @@ impl App {
                     }
                     Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
                         let before = (*minimum, *maximum, *max_change, pattern.clone());
-                        optional_number(settings, "Minimum", minimum);
-                        optional_number(settings, "Maximum", maximum);
-                        optional_number(settings, "Maximum absolute change", max_change);
+                        settings.add_enabled_ui(!parameters.contains(&InputParameter::Minimum), |ui| optional_number(ui, "Minimum", minimum));
+                        settings.add_enabled_ui(!parameters.contains(&InputParameter::Maximum), |ui| optional_number(ui, "Maximum", maximum));
+                        settings.add_enabled_ui(!parameters.contains(&InputParameter::MaxChange), |ui| optional_number(ui, "Maximum absolute change", max_change));
                         settings.label("Required text pattern (regular expression, optional)");
                         settings.text_edit_singleline(pattern);
                         settings.weak("Use ^ and $ for a whole-value match, e.g. ^[0-9]+\\.[0-9]{2}$. Rejected readings never reach actions or update the last accepted value.");
@@ -1803,6 +1859,19 @@ impl App {
         } else if !open || clicked_outside {
             self.selected = None;
             self.node_settings_open = false;
+        }
+        if !delete && !parameter_changes.is_empty() {
+            self.sync_graph_positions();
+            let name = self.graph.nodes[index].name.clone();
+            self.set_running(false);
+            for (parameter, enabled) in parameter_changes {
+                if let Err(error) = self.graph.set_parameter_input(&name, parameter, enabled) {
+                    self.record_status(log::Level::Error, error);
+                    return;
+                }
+            }
+            self.rebuild_snarl();
+            self.record_status(log::Level::Info, "Updated input pins; connect each required setting before running".into());
         }
         self.handle_subflow_requests(ctx);
     }
