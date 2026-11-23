@@ -101,6 +101,7 @@ Read all 5 documentation files in order above
 - **Model-backed regression test:** `cargo test --release --features gui --lib desktop::tests::small_price_ocr_preserves_decimals_and_text -- --ignored`
 - **Typed titles, icons, and grouped creation menu:** [README.md](README.md) → Using the application
 - **Creating groups and assigning nodes with the Group dropdown:** [README.md](README.md) → Editing, validation, and safe testing
+- **Grouped Find node tree and sample-text regex generator:** [README.md](README.md) → Editing, validation, and safe testing
 
 #### Node Deletion
 - **Status:** CHANGES_CHECKLIST.md → Issue 3 section

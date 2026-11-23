@@ -12,6 +12,7 @@ impl App {
             copy_drag: None,
             add_menu_open: false,
             group_dialog: None,
+            regex_dialog: None,
             running: false,
             overlays_hidden: false,
             overlay_ready_at: None,
@@ -254,6 +255,7 @@ impl App {
             || self.recovery.is_some()
             || self.recovery_error.is_some()
             || self.group_dialog.is_some()
+            || self.regex_dialog.is_some()
         {
             return;
         }
@@ -436,8 +438,11 @@ impl App {
     }
 
     pub(super) fn show_editor_windows(&mut self, ctx: &egui::Context) {
+        let mut search_selection = None;
         egui::Window::new("Find node")
             .id(Id::new("node-search"))
+            .default_size([440.0, 480.0])
+            .min_size(egui::vec2(300.0, 200.0))
             .open(&mut self.search_open)
             .show(ctx, |ui| {
                 ui.add(
@@ -445,36 +450,49 @@ impl App {
                         .hint_text("Title, name, type, or group"),
                 );
                 let query = self.search_text.trim().to_lowercase();
+                let groups = find_node_groups(&self.graph, &query);
+                let count: usize = groups.iter().map(|(_, nodes)| nodes.len()).sum();
+                ui.weak(format!("{count} of {} nodes", self.graph.nodes.len()));
                 egui::ScrollArea::vertical()
-                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height().max(120.0))
                     .show(ui, |ui| {
-                        for (index, node) in self.graph.nodes.iter().enumerate() {
-                            let description = format!(
-                                "{}  ({})  {}",
-                                node.display_title(),
-                                node.type_name(),
-                                node.group
-                            );
-                            if format!("{description} {}", node.name)
-                                .to_lowercase()
-                                .contains(&query)
-                                && ui
-                                    .selectable_label(self.selected == Some(index), description)
-                                    .clicked()
-                            {
-                                self.selected = Some(index);
-                                self.node_settings_open = true;
-                                self.focus_node = Some(node.name.clone());
-                            }
+                        if count == 0 { ui.label("No matching nodes."); }
+                        for (group, nodes) in groups {
+                            let title = if group.is_empty() { "Ungrouped" } else { &group };
+                            egui::CollapsingHeader::new(format!("{title} ({})", nodes.len()))
+                                .id_salt(("find-node-group", &group))
+                                .default_open(true)
+                                .open((!query.is_empty()).then_some(true))
+                                .show(ui, |ui| {
+                                    for index in nodes {
+                                        let node = &self.graph.nodes[index];
+                                        let style = node_style(node.type_name());
+                                        let label = format!("{} {}  ({})",
+                                            style.icon, node.display_title(), style.label);
+                                        let response = ui.selectable_label(self.selected == Some(index), label)
+                                            .on_hover_text(format!("{}\nName: {}\nType: {}",
+                                                node.display_title(), node.name, node.type_name()));
+                                        if response.clicked() {
+                                            search_selection = Some(index);
+                                        }
+                                    }
+                                });
                         }
                     });
             });
+        if let Some(index) = search_selection {
+            self.selected = Some(index);
+            self.node_settings_open = true;
+            self.focus_node = Some(self.graph.nodes[index].name.clone());
+        }
         egui::Window::new("Graph validation")
             .open(&mut self.validation_open)
             .show(ctx, |ui| {
                 if self.validation.is_empty() {
                     ui.label("No graph problems found.");
                 }
+
                 for issue in &self.validation {
                     let label = match &issue.node {
                         Some(node) => format!("{node}: {}", issue.message),
@@ -775,6 +793,142 @@ pub(super) fn event_settings(ui: &mut egui::Ui, event: &mut EventSource) {
     }
 }
 
+impl App {
+    pub(super) fn open_regex_generator(&mut self, index: usize) {
+        let node = &self.graph.nodes[index];
+        self.regex_dialog = Some(RegexDialog {
+            node: node.name.clone(), sample: String::new(),
+            normalize_whitespace: matches!(node.kind, Kind::AssertText { .. } | Kind::WaitForText { .. }),
+            whole_text: true, flexible_whitespace: true, generalize_digits: false,
+            focus_sample: true, error: None,
+        });
+    }
+
+    fn apply_generated_regex(&mut self, name: &str, pattern: &str) -> Result<(), String> {
+        regex::Regex::new(pattern).map_err(|error| format!("Invalid generated regex: {error}"))?;
+        let node = self.graph.nodes.iter_mut().find(|node| node.name == name)
+            .ok_or_else(|| format!("Cannot apply regex: node {name:?} no longer exists."))?;
+        match &mut node.kind {
+            Kind::AssertText { expected, matching, .. } => {
+                *expected = pattern.into();
+                *matching = TextMatch::Regex;
+            }
+            Kind::WaitForText { expected, matching, pending, .. } => {
+                *expected = pattern.into();
+                *matching = TextMatch::Regex;
+                *pending = None;
+            }
+            Kind::ValidateNumber { pattern: current, last, .. } => {
+                *current = pattern.into();
+                *last = None;
+            }
+            _ => return Err("This node does not support a regular expression.".into()),
+        }
+        self.set_running(false);
+        self.record_status(log::Level::Info, format!("Applied generated regex to {name:?}; automation remains stopped"));
+        Ok(())
+    }
+
+    pub(super) fn show_regex_generator(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.regex_dialog else { return };
+        let mut apply = None;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::new("regex-generator")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Generate regular expression");
+            ui.label("Type or paste sample text");
+            let sample = ui.add(egui::TextEdit::multiline(&mut dialog.sample)
+                .id(Id::new("regex-sample")).desired_rows(3).desired_width(f32::INFINITY));
+            if dialog.focus_sample {
+                sample.request_focus();
+                dialog.focus_sample = false;
+            }
+            ui.checkbox(&mut dialog.whole_text, "Match the whole text");
+            ui.checkbox(&mut dialog.flexible_whitespace, "Allow flexible whitespace");
+            ui.checkbox(&mut dialog.generalize_digits, "Allow different digits (same digit counts)");
+            if dialog.generalize_digits {
+                ui.colored_label(Color32::from_rgb(180, 110, 0),
+                    "This broadens matching. Review quantities, prices, and identifiers carefully.");
+            }
+            let sample = if dialog.normalize_whitespace {
+                ui.weak("Text conditions normalize whitespace before matching.");
+                dialog.sample.split_whitespace().collect::<Vec<_>>().join(" ")
+            } else {
+                dialog.sample.clone()
+            };
+            ui.separator();
+            let generated = regex_from_sample(&sample, dialog.whole_text,
+                dialog.flexible_whitespace, dialog.generalize_digits);
+            match &generated {
+                Ok(pattern) => {
+                    ui.label("Generated regex (review before applying)");
+                    ui.add(egui::Label::new(egui::RichText::new(pattern).monospace()).wrap());
+                }
+                Err(error) => { ui.label(error); }
+            }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(generated.is_ok(), egui::Button::new("Apply regex")).clicked() {
+                    apply = generated.ok().map(|pattern| (dialog.node.clone(), pattern));
+                }
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel || response.should_close() {
+            self.regex_dialog = None;
+        } else if let Some((name, pattern)) = apply {
+            match self.apply_generated_regex(&name, &pattern) {
+                Ok(()) => self.regex_dialog = None,
+                Err(error) => self.regex_dialog.as_mut().expect("regex dialog is open").error = Some(error),
+            }
+        }
+    }
+}
+
+fn find_node_groups(graph: &Graph, query: &str) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<_> = graph.group_names().into_iter().map(str::to_owned).collect();
+    if graph.nodes.iter().any(|node| node.group.trim().is_empty()) {
+        groups.insert(0, String::new());
+    }
+    groups.into_iter().filter_map(|group| {
+        let mut nodes: Vec<_> = graph.nodes.iter().enumerate()
+            .filter(|(_, node)| (node.group == group || (group.is_empty() && node.group.trim().is_empty()))
+                && format!("{} {} {} {} {}", node.display_title(), node.name,
+                    node.type_name(), node_style(node.type_name()).label, group)
+                    .to_lowercase().contains(query))
+            .map(|(index, _)| index).collect();
+        nodes.sort_by_key(|index| (graph.nodes[*index].display_title().to_lowercase(), &graph.nodes[*index].name));
+        (query.is_empty() || !nodes.is_empty()).then_some((group, nodes))
+    }).collect()
+}
+
+fn regex_from_sample(sample: &str, whole_text: bool, flexible_whitespace: bool, generalize_digits: bool) -> Result<String, String> {
+    if sample.trim().is_empty() {
+        return Err("Enter sample text to generate a regex.".into());
+    }
+    let mut pattern = String::new();
+    let mut chars = sample.chars().peekable();
+    while let Some(character) = chars.next() {
+        if flexible_whitespace && character.is_whitespace() {
+            while chars.peek().is_some_and(|next| next.is_whitespace()) { chars.next(); }
+            pattern.push_str(r"\s+");
+        } else if generalize_digits && character.is_ascii_digit() {
+            let mut count = 1;
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+                count += 1;
+            }
+            pattern.push_str("[0-9]");
+            if count > 1 { pattern.push_str(&format!("{{{count}}}")); }
+        } else {
+            pattern.push_str(&regex::escape(&character.to_string()));
+        }
+    }
+    Ok(if whole_text { format!("^{pattern}$") } else { pattern })
+}
+
 pub(super) struct UnavailableBackend;
 
 impl Backend for UnavailableBackend {
@@ -818,6 +972,154 @@ mod tests {
         );
         output.textures_delta.clear();
         output
+    }
+
+    #[test]
+    fn find_tree_includes_every_node_once_and_filters_names_types_and_groups() {
+        let mut graph = Graph::default();
+        graph.add_group("Empty").unwrap();
+        for (index, _) in KINDS.iter().enumerate() {
+            let mut node = Node::new(&format!("node-{index}"), new_kind(index));
+            node.title = format!("Title {index:02}");
+            node.group = ["Ticket", "Review", ""][index % 3].into();
+            graph.add_node(node).unwrap();
+        }
+        let original = graph.to_json();
+        let groups = find_node_groups(&graph, "");
+        assert!(groups.iter().any(|(name, nodes)| name == "Empty" && nodes.is_empty()));
+        assert!(groups.iter().any(|(name, nodes)| name.is_empty() && !nodes.is_empty()));
+        let mut indices: Vec<_> = groups.into_iter().flat_map(|(_, nodes)| nodes).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..KINDS.len()).collect::<Vec<_>>());
+        assert_eq!(find_node_groups(&graph, "assert text")[0].1, [17]);
+        assert_eq!(find_node_groups(&graph, "node-20")[0].1, [20]);
+        let tickets = find_node_groups(&graph, "ticket");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].1.len(), KINDS.len().div_ceil(3));
+        assert!(tickets[0].1.iter().all(|index| graph.nodes[*index].group == "Ticket"));
+        assert!(find_node_groups(&graph, "not present").is_empty());
+        assert_eq!(graph.to_json(), original);
+    }
+
+    #[test]
+    fn generated_regex_escapes_literals_and_generalizes_only_explicit_options() {
+        let sample = "[Buy] NVIDIA (NVDA) $165.05 + fee?";
+        let literal = regex::Regex::new(&regex_from_sample(sample, true, false, false).unwrap()).unwrap();
+        assert!(literal.is_match(sample));
+        assert!(!literal.is_match("[Buy] NVIDIA (NVDA) $999.05 + fee?"));
+        assert!(!literal.is_match(&format!("prefix {sample}")));
+        let flexible = regex::Regex::new(&regex_from_sample("PAPER TRADING", true, true, false).unwrap()).unwrap();
+        assert!(flexible.is_match("PAPER \t TRADING"));
+        assert!(!flexible.is_match("PAPERTRADING"));
+        let numbers = regex::Regex::new(&regex_from_sample(sample, true, true, true).unwrap()).unwrap();
+        assert!(numbers.is_match("[Buy] NVIDIA (NVDA) $999.12 + fee?"));
+        assert!(!numbers.is_match("[Buy] NVIDIA (NVDA) $9999.12 + fee?"));
+        assert!(!numbers.is_match("[Sell] NVIDIA (NVDA) $999.12 + fee?"));
+        let partial = regex::Regex::new(&regex_from_sample("NVDA", false, false, false).unwrap()).unwrap();
+        assert!(partial.is_match("Buy NVDA shares"));
+        assert!(regex_from_sample(" \n ", true, true, false).is_err());
+    }
+
+    #[test]
+    fn regex_generator_is_regex_only_and_applies_pasted_text_without_screen_access() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.kind = 17;
+        app.add_node();
+        app.selected = Some(0);
+        app.node_settings_open = true;
+        for mode in TextMatch::ALL {
+            if let Kind::AssertText { matching, .. } = &mut app.graph.nodes[0].kind {
+                *matching = mode;
+            }
+            render(&ctx, &mut app, vec![]);
+            let output = render(&ctx, &mut app, vec![]);
+            let generate = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Generate..." =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            });
+            assert_eq!(generate.is_some(), mode == TextMatch::Regex);
+            if let Some(pos) = generate {
+                let label_y = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Expected screen text" => Some(text.pos.y),
+                    _ => None,
+                }).unwrap();
+                assert!(pos.y - label_y < 50.0, "regex input must occupy a single compact row");
+                let event = |pressed| egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                };
+                render(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), event(true)]);
+                render(&ctx, &mut app, vec![event(false)]);
+            }
+        }
+        assert!(app.regex_dialog.is_some());
+        assert!(app.node_settings_open);
+        let before = app.graph.to_json();
+        render(&ctx, &mut app, vec![]);
+        render(&ctx, &mut app, vec![egui::Event::Text("discard this sample".into())]);
+        render(&ctx, &mut app, vec![egui::Event::Key {
+            key: egui::Key::Escape, physical_key: None, pressed: true,
+            repeat: false, modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(app.regex_dialog.is_none());
+        assert_eq!(app.graph.to_json(), before, "cancelling must preserve the pattern");
+        app.open_regex_generator(0);
+        render(&ctx, &mut app, vec![egui::Event::Key {
+            key: egui::Key::Escape, physical_key: None, pressed: false,
+            repeat: false, modifiers: egui::Modifiers::NONE,
+        }]);
+        let output = render(&ctx, &mut app, vec![egui::Event::Text(" PAPER \nTRADING (demo)+ ".into())]);
+        assert_eq!(app.graph.to_json(), before, "preview must not apply automatically");
+        let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Apply regex" =>
+                Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        }).unwrap();
+        let event = |pressed| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+        };
+        render(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), event(true)]);
+        render(&ctx, &mut app, vec![event(false)]);
+        assert!(app.regex_dialog.is_none());
+        assert!(!app.running);
+        let Kind::AssertText { expected, matching, .. } = &app.graph.nodes[0].kind else { panic!("wrong node") };
+        assert_eq!(*matching, TextMatch::Regex);
+        assert!(regex::Regex::new(expected).unwrap().is_match("PAPER TRADING (demo)+"));
+        app.undo_edit(&ctx, false);
+        assert_eq!(app.graph.to_json(), before);
+    }
+
+    #[test]
+    fn applying_regex_stops_execution_resets_numeric_state_and_reports_invalid_targets() {
+        let mut app = app();
+        for kind in [10, 16] {
+            app.kind = kind;
+            app.add_node();
+            let index = app.graph.nodes.len() - 1;
+            let name = app.graph.nodes[index].name.clone();
+            if let Kind::ValidateNumber { last, .. } = &mut app.graph.nodes[index].kind {
+                *last = Some(42.0);
+            }
+            app.running = true;
+            app.apply_generated_regex(&name, r"^[0-9]{2}$").unwrap();
+            assert!(!app.running);
+            match &app.graph.nodes[index].kind {
+                Kind::ValidateNumber { pattern, last, .. } => {
+                    assert_eq!(pattern, r"^[0-9]{2}$");
+                    assert!(last.is_none());
+                }
+                Kind::WaitForText { expected, matching, .. } => {
+                    assert_eq!(expected, r"^[0-9]{2}$");
+                    assert_eq!(*matching, TextMatch::Regex);
+                }
+                _ => panic!("wrong node"),
+            }
+            let before = app.graph.to_json();
+            assert!(app.apply_generated_regex(&name, "[").is_err());
+            assert!(app.apply_generated_regex("deleted-node", "^test$").is_err());
+            assert_eq!(app.graph.to_json(), before);
+        }
     }
 
     #[test]
@@ -1172,7 +1474,7 @@ mod tests {
             .iter()
             .find_map(|shape| match &shape.shape {
                 egui::Shape::Text(text)
-                    if text.galley.text().starts_with("BTC price  (constant)") =>
+                    if text.galley.text() == "# BTC price  (Constant)" =>
                 {
                     Some(text.pos + text.galley.size() * 0.5)
                 }

@@ -49,6 +49,17 @@ struct GroupDialog {
     focus_name: bool,
 }
 
+struct RegexDialog {
+    node: String,
+    sample: String,
+    normalize_whitespace: bool,
+    whole_text: bool,
+    flexible_whitespace: bool,
+    generalize_digits: bool,
+    focus_sample: bool,
+    error: Option<String>,
+}
+
 struct App {
     graph: Graph,
     snarl: Snarl<usize>,
@@ -59,6 +70,7 @@ struct App {
     copy_drag: Option<egui_snarl::NodeId>,
     add_menu_open: bool,
     group_dialog: Option<GroupDialog>,
+    regex_dialog: Option<RegexDialog>,
     running: bool,
     overlays_hidden: bool,
     overlay_ready_at: Option<Instant>,
@@ -705,11 +717,15 @@ fn new_kind(i: usize) -> Kind {
 
 fn text_condition_settings(
     ui: &mut egui::Ui, expected: &mut String, matching: &mut TextMatch,
-    case_sensitive: &mut bool, single_line: &mut bool,
+    case_sensitive: &mut bool, single_line: &mut bool, generate_regex: &mut bool,
 ) -> bool {
     let before = (expected.clone(), *matching, *case_sensitive, *single_line);
     ui.label("Expected screen text");
-    ui.text_edit_singleline(expected);
+    if *matching == TextMatch::Regex {
+        *generate_regex |= regex_input(ui, expected);
+    } else {
+        ui.text_edit_singleline(expected);
+    }
     egui::ComboBox::from_id_salt("text-match-mode").selected_text(matching.label()).show_ui(ui, |ui| {
         for choice in TextMatch::ALL {
             ui.selectable_value(matching, choice, choice.label());
@@ -719,6 +735,19 @@ fn text_condition_settings(
     ui.checkbox(single_line, "Single-line OCR");
     ui.weak("Whitespace is normalized. Successful checks pass the original trigger onward.");
     before != (expected.clone(), *matching, *case_sensitive, *single_line)
+}
+
+fn regex_input(ui: &mut egui::Ui, text: &mut String) -> bool {
+    let mut generate = false;
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            generate = ui.button("Generate...")
+                .on_hover_text("Generate a regular expression from typed or pasted sample text")
+                .clicked();
+            ui.add(egui::TextEdit::singleline(text).desired_width(ui.available_width()));
+        });
+    });
+    generate
 }
 
 fn format_settings(ui: &mut egui::Ui, format: &mut Format) {
@@ -1109,6 +1138,7 @@ impl App {
         self.node_settings_open = false;
         self.add_menu_open = false;
         self.group_dialog = None;
+        self.regex_dialog = None;
         self.region_scales.clear();
         self.activity.clear();
         self.overlay_anchors.clear();
@@ -1724,6 +1754,7 @@ impl App {
         let groups: Vec<_> = self.graph.group_names().into_iter().map(str::to_owned).collect();
         let mut selected_group = self.graph.nodes[index].group.clone();
         let mut create_group = false;
+        let mut generate_regex = false;
         let popup_clicked = egui::Popup::is_any_open(ctx)
             && ctx.pointer_interact_pos()
                 .and_then(|pos| ctx.layer_id_at(pos))
@@ -1928,7 +1959,7 @@ impl App {
                     }
                     Kind::WaitForText { expected, matching, case_sensitive, single_line, timeout_ms, poll_ms, pending } => {
                         let before_timing = (*timeout_ms, *poll_ms);
-                        let changed = text_condition_settings(settings, expected, matching, case_sensitive, single_line);
+                        let changed = text_condition_settings(settings, expected, matching, case_sensitive, single_line, &mut generate_regex);
                         settings.horizontal(|ui| {
                             ui.label("Timeout (ms)");
                             ui.add(egui::DragValue::new(timeout_ms).range(1..=120_000));
@@ -1944,7 +1975,7 @@ impl App {
                         }
                     }
                     Kind::AssertText { expected, matching, case_sensitive, single_line } => {
-                        screen_action_changed |= text_condition_settings(settings, expected, matching, case_sensitive, single_line);
+                        screen_action_changed |= text_condition_settings(settings, expected, matching, case_sensitive, single_line, &mut generate_regex);
                         settings.weak("Checks immediately. A mismatch stops the workflow; use Wait for text for transitions.");
                     }
                     Kind::Once { armed, fired } => {
@@ -1988,7 +2019,7 @@ impl App {
                         settings.add_enabled_ui(!parameters.contains(&InputParameter::Maximum), |ui| optional_number(ui, "Maximum", maximum));
                         settings.add_enabled_ui(!parameters.contains(&InputParameter::MaxChange), |ui| optional_number(ui, "Maximum absolute change", max_change));
                         settings.label("Required text pattern (regular expression, optional)");
-                        settings.text_edit_singleline(pattern);
+                        generate_regex |= regex_input(settings, pattern);
                         settings.weak("Use ^ and $ for a whole-value match, e.g. ^[0-9]+\\.[0-9]{2}$. Rejected readings never reach actions or update the last accepted value.");
                         if before != (*minimum, *maximum, *max_change, pattern.clone()) {
                             *last = None;
@@ -2036,7 +2067,10 @@ impl App {
         if create_group {
             self.open_group_dialog(Some(self.graph.nodes[index].name.clone()));
         }
-        let clicked_outside = self.group_dialog.is_none()
+        if generate_regex {
+            self.open_regex_generator(index);
+        }
+        let clicked_outside = self.group_dialog.is_none() && self.regex_dialog.is_none()
             && window.is_some_and(|window| window.response.clicked_elsewhere())
             && !selected_node_clicked
             && !popup_clicked;
@@ -2128,9 +2162,9 @@ impl App {
         }
     }
 
-    fn group_dialog_open(&self) -> bool {
-        self.group_dialog.is_some()
-            || self.subflow_editor.as_ref().is_some_and(|(_, editor)| editor.group_dialog_open())
+    fn editing_dialog_open(&self) -> bool {
+        self.group_dialog.is_some() || self.regex_dialog.is_some()
+            || self.subflow_editor.as_ref().is_some_and(|(_, editor)| editor.editing_dialog_open())
     }
 
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
@@ -2358,6 +2392,7 @@ impl App {
         self.sync_graph_positions();
         self.show_settings(&ctx);
         self.show_group_dialog(&ctx);
+        self.show_regex_generator(&ctx);
     }
 
     fn selected_overlay_key(&self) -> Option<String> {
@@ -2400,7 +2435,7 @@ impl App {
         let running = self.running;
         let visibility_changed = self.overlays_hidden != running;
         let locked = self.pending_file_action.is_some() || self.recovery.is_some()
-            || self.recovery_error.is_some() || self.group_dialog_open();
+            || self.recovery_error.is_some() || self.editing_dialog_open();
         let selected = self.selected_overlay_key();
         let clicked = {
             let mut state = OverlayState {
