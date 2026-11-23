@@ -1,9 +1,64 @@
-use crate::backend::{Backend, Region};
+use crate::backend::{Backend, KeyAction, Region};
 use crate::graph::Graph;
 use rhai::{Dynamic, Engine, Scope};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMatch {
+    Exact,
+    #[default]
+    Contains,
+    Regex,
+}
+
+impl TextMatch {
+    pub const ALL: [Self; 3] = [Self::Exact, Self::Contains, Self::Regex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "Exact text",
+            Self::Contains => "Contains text",
+            Self::Regex => "Regular expression",
+        }
+    }
+
+    pub fn validate(self, expected: &str) -> Result<(), String> {
+        if expected.trim().is_empty() {
+            return Err("expected text must not be empty".into());
+        }
+        if self == Self::Regex {
+            regex::Regex::new(expected).map_err(|error| format!("invalid text regex: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn matches(self, actual: &str, expected: &str, case_sensitive: bool) -> Result<bool, String> {
+        self.validate(expected)?;
+        let actual = actual.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self == Self::Regex {
+            return regex::RegexBuilder::new(expected).case_insensitive(!case_sensitive)
+                .build().map(|pattern| pattern.is_match(&actual)).map_err(|error| error.to_string());
+        }
+        let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (actual, expected) = if case_sensitive { (actual, expected) }
+            else { (actual.to_lowercase(), expected.to_lowercase()) };
+        Ok(if self == Self::Exact { actual == expected } else { actual.contains(&expected) })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWait {
+    input: Value,
+    started: Instant,
+    next_poll: Instant,
+}
+
+fn default_timeout_ms() -> u64 { 10_000 }
+fn default_poll_ms() -> u64 { 100 }
 
 /// Value flowing between nodes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -261,6 +316,46 @@ pub enum Kind {
     Click {
         button: String,
     },
+    #[serde(rename = "wait_for_text")]
+    WaitForText {
+        expected: String,
+        #[serde(default)]
+        matching: TextMatch,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        single_line: bool,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_poll_ms")]
+        poll_ms: u64,
+        #[serde(skip)]
+        pending: Option<PendingWait>,
+    },
+    #[serde(rename = "assert_text")]
+    AssertText {
+        expected: String,
+        #[serde(default)]
+        matching: TextMatch,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        single_line: bool,
+    },
+    Once {
+        #[serde(default)]
+        armed: bool,
+        #[serde(skip)]
+        fired: bool,
+    },
+    #[serde(rename = "set_field")]
+    SetField {
+        #[serde(default)]
+        text: String,
+    },
+    Keypress {
+        key: KeyAction,
+    },
     #[serde(rename = "validate_number")]
     ValidateNumber {
         minimum: Option<f64>,
@@ -312,6 +407,7 @@ impl Node {
         let has_region = matches!(
             kind,
             Kind::Ocr { .. } | Kind::Keyboard { .. } | Kind::Click { .. }
+                | Kind::WaitForText { .. } | Kind::AssertText { .. } | Kind::SetField { .. }
         );
         Node {
             name: name.into(),
@@ -346,6 +442,8 @@ impl Node {
             }
             Kind::Hysteresis { band, .. } | Kind::Threshold { band, .. } => *band = None,
             Kind::ValidateNumber { last, .. } => *last = None,
+            Kind::WaitForText { pending, .. } => *pending = None,
+            Kind::Once { fired, .. } => *fired = false,
             Kind::Subflow { graph } => graph.reset_runtime(),
             _ => {}
         }
@@ -358,6 +456,18 @@ impl Node {
             Kind::CompareInputs { .. } => 2,
             _ if !self.available_input_parameters().is_empty() => 1 + self.input_parameters.len(),
             _ => 1,
+        }
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        matches!(&self.kind, Kind::WaitForText { pending: Some(_), .. })
+    }
+
+    pub(crate) fn cancel_wait(&mut self) {
+        match &mut self.kind {
+            Kind::WaitForText { pending, .. } => *pending = None,
+            Kind::Subflow { graph } => graph.cancel_waits(),
+            _ => {}
         }
     }
 
@@ -427,6 +537,11 @@ impl Node {
             Kind::Threshold { .. } => "threshold",
             Kind::Keyboard { .. } => "keyboard",
             Kind::Click { .. } => "click",
+            Kind::WaitForText { .. } => "wait_for_text",
+            Kind::AssertText { .. } => "assert_text",
+            Kind::Once { .. } => "once",
+            Kind::SetField { .. } => "set_field",
+            Kind::Keypress { .. } => "keypress",
             Kind::ValidateNumber { .. } => "validate_number",
             Kind::Event { .. } => "event",
             Kind::Note { .. } => "note",
@@ -447,6 +562,7 @@ impl Node {
                 *last = None;
             }
             Kind::Subflow { graph } => graph.reset_runtime(),
+            Kind::WaitForText { pending, .. } => *pending = None,
             _ => {}
         }
     }
@@ -726,6 +842,75 @@ impl Node {
                 log::info!("[CLICK] Clicking at ({}, {}) with button: {}", x, y, button);
                 backend.click(x, y, button)?;
                 Ok(Some(Value::Bool(true)))
+            }
+            Kind::Once { armed, fired } => {
+                if !*armed || *fired { return Ok(None); }
+                let Some(input) = inputs.first() else { return Ok(None) };
+                *fired = true;
+                log::info!("[ONCE] '{}' latched; reset explicitly before another attempt", self.name);
+                Ok(Some(input.clone()))
+            }
+            Kind::SetField { text } => {
+                let Some(input) = inputs.first() else { return Ok(None) };
+                let text = if text.is_empty() { input.to_text() } else { text.clone() };
+                let (x, y) = region.center();
+                backend.click(x, y, "left")?;
+                backend.press_key(KeyAction::SelectAll)?;
+                backend.type_text(&text)?;
+                log::info!("[SET FIELD] '{}' replaced field with {text:?}; verify with Wait for text", self.name);
+                Ok(Some(Value::Text(text)))
+            }
+            Kind::Keypress { key } => {
+                let Some(input) = inputs.first() else { return Ok(None) };
+                backend.press_key(*key)?;
+                log::info!("[KEYPRESS] '{}' pressed {}", self.name, key.label());
+                Ok(Some(input.clone()))
+            }
+            Kind::AssertText { expected, matching, case_sensitive, single_line } => {
+                let Some(input) = inputs.first() else { return Ok(None) };
+                matching.validate(expected)?;
+                let pixels = backend.capture(&region)?;
+                let actual = if *single_line { backend.ocr_single_line(&region, &pixels)? }
+                    else { backend.ocr(&region, &pixels)? };
+                if !matching.matches(&actual, expected, *case_sensitive)? {
+                    return Err(format!("screen assertion failed: expected {matching:?} {expected:?}, read {actual:?}"));
+                }
+                log::info!("[ASSERT] '{}' matched {expected:?}", self.name);
+                Ok(Some(input.clone()))
+            }
+            Kind::WaitForText { expected, matching, case_sensitive, single_line, timeout_ms, poll_ms, pending } => {
+                matching.validate(expected)?;
+                if !(1..=120_000).contains(timeout_ms) || *poll_ms == 0 || poll_ms > timeout_ms {
+                    return Err("wait requires timeout 1..120000 ms and poll interval 1..timeout ms".into());
+                }
+                let now = backend.now();
+                if pending.is_none() {
+                    let Some(input) = inputs.first() else { return Ok(None) };
+                    *pending = Some(PendingWait { input: input.clone(), started: now, next_poll: now });
+                    log::info!("[WAIT] '{}' waiting for {expected:?}, timeout {timeout_ms} ms", self.name);
+                }
+                let state = pending.take().expect("wait initialized");
+                if now.duration_since(state.started) >= Duration::from_millis(*timeout_ms) {
+                    return Err(format!("timed out after {timeout_ms} ms waiting for {expected:?}; check screen/order history before retrying"));
+                }
+                if now < state.next_poll {
+                    *pending = Some(state);
+                    return Ok(None);
+                }
+                let pixels = backend.capture(&region)?;
+                let actual = if *single_line { backend.ocr_single_line(&region, &pixels)? }
+                    else { backend.ocr(&region, &pixels)? };
+                if backend.now().duration_since(state.started) >= Duration::from_millis(*timeout_ms) {
+                    return Err(format!("timed out after {timeout_ms} ms waiting for {expected:?}; check screen/order history before retrying"));
+                }
+                if matching.matches(&actual, expected, *case_sensitive)? {
+                    log::info!("[WAIT] '{}' matched {expected:?}", self.name);
+                    Ok(Some(state.input))
+                } else {
+                    log::debug!("[WAIT] '{}' read {actual:?}", self.name);
+                    *pending = Some(PendingWait { next_poll: now + Duration::from_millis(*poll_ms), ..state });
+                    Ok(None)
+                }
             }
             Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
                 let Some(input) = inputs.first() else { return Ok(None) };

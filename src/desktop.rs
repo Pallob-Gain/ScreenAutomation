@@ -1,7 +1,7 @@
 //! Real backends: xcap (capture), OCRS (OCR), enigo (input).
-use crate::backend::{Backend, Region};
+use crate::backend::{Backend, KeyAction, Region};
 use directories::ProjectDirs;
-use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
 use rten_imageproc::{RectF, RotatedRect};
@@ -162,7 +162,42 @@ fn recognize_single_line(
     if pixels.is_empty() {
         return Ok(String::new());
     }
-    let image = ImageSource::from_bytes(&pixels, (width, height))
+    let text = recognize_line(engine, &pixels, width, height)?;
+    let numeric = text.chars().filter(char::is_ascii_digit).count() >= 2
+        && text.matches('.').count() <= 1
+        && text.chars().all(|c| c.is_ascii_digit() || c.is_ascii_whitespace()
+            || matches!(c, '$' | '+' | '-' | '.' | '%'));
+    if height >= 24 || !numeric {
+        return Ok(text);
+    }
+    // Preserve tiny punctuation before the recognizer's interpolated resize.
+    let mut enlarged = Vec::with_capacity(pixels.len() * 4);
+    for y in 0..height * 2 {
+        for x in 0..width * 2 {
+            let start = ((y / 2 * width + x / 2) * 3) as usize;
+            enlarged.extend_from_slice(&pixels[start..start + 3]);
+        }
+    }
+    let enhanced = recognize_line(engine, &enlarged, width * 2, height * 2)?;
+    validate_numeric_readings(&text, &enhanced)?;
+    Ok(enhanced)
+}
+
+fn validate_numeric_readings(original: &str, enhanced: &str) -> Result<(), String> {
+    let original: String = original.split_whitespace().collect();
+    let enhanced: String = enhanced.split_whitespace().collect();
+    let without_dots = |text: &str| text.chars().filter(|c| *c != '.').collect::<String>();
+    if without_dots(&original) != without_dots(&enhanced)
+        || (original.contains('.') && original != enhanced)
+        || enhanced.matches('.').count() > 1
+    {
+        return Err(format!("Numeric OCR disagrees between scales: {original:?} versus {enhanced:?}"));
+    }
+    Ok(())
+}
+
+fn recognize_line(engine: &OcrEngine, pixels: &[u8], width: u32, height: u32) -> Result<String, String> {
+    let image = ImageSource::from_bytes(pixels, (width, height))
         .map_err(|e| e.to_string())?;
     let input = engine.prepare_input(image).map_err(|e| e.to_string())?;
     // Keep punctuation inside the recognition crop instead of relying on word detection.
@@ -179,9 +214,14 @@ fn recognize_single_line(
 }
 
 fn prepare_single_line(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, u32, u32), String> {
-    ImageSource::from_bytes(pixels, (width, height)).map_err(|e| e.to_string())?;
     if width == 0 || height == 0 {
         return Err("Single-line OCR requires a non-empty region".into());
+    }
+    let expected_len = (width as usize).checked_mul(height as usize)
+        .and_then(|len| len.checked_mul(3))
+        .ok_or_else(|| "Single-line OCR dimensions are too large".to_string())?;
+    if pixels.len() != expected_len {
+        return Err("Single-line OCR requires an RGB pixel buffer matching its region".into());
     }
     // Single-line regions have a plain background and a small margin around the text.
     let background = &pixels[..3];
@@ -210,7 +250,8 @@ fn prepare_single_line(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8
         let end = ((y * width + right) * 3) as usize;
         out.extend(pixels[start..end].iter().map(|&v| if invert { 255 - v } else { v }));
     }
-    Ok((out, right - left, bottom - top))
+    let (width, height) = (right - left, bottom - top);
+    Ok((out, width, height))
 }
 
 impl Backend for Desktop {
@@ -248,6 +289,29 @@ impl Backend for Desktop {
         self.enigo.text(text).map_err(|e| e.to_string())
     }
 
+    fn press_key(&mut self, key: KeyAction) -> Result<(), String> {
+        if key == KeyAction::SelectAll {
+            let modifier = if cfg!(target_os = "macos") { Key::Meta } else { Key::Control };
+            self.enigo.key(modifier, Direction::Press).map_err(|e| e.to_string())?;
+            let selected = self.enigo.key(Key::Unicode('a'), Direction::Click);
+            let released = self.enigo.key(modifier, Direction::Release);
+            if let Err(error) = &released {
+                log::error!("Could not release select-all modifier: {error}");
+            }
+            return selected.and(released).map_err(|e| e.to_string());
+        }
+        let key = match key {
+            KeyAction::Tab => Key::Tab,
+            KeyAction::Enter => Key::Return,
+            KeyAction::Escape => Key::Escape,
+            KeyAction::ArrowUp => Key::UpArrow,
+            KeyAction::ArrowDown => Key::DownArrow,
+            KeyAction::Backspace => Key::Backspace,
+            KeyAction::SelectAll => unreachable!(),
+        };
+        self.enigo.key(key, Direction::Click).map_err(|e| e.to_string())
+    }
+
     fn click(&mut self, x: i32, y: i32, button: &str) -> Result<(), String> {
         self.enigo
             .move_mouse(x, y, Coordinate::Abs)
@@ -268,6 +332,46 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a local OCR recognition model"]
+    fn small_price_ocr_preserves_decimals_and_text() {
+        // Offline 100x28 RGB crops of Segoe UI Semibold at 10.5 and 11.725 pixels.
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests").join("fixtures").join("ocr");
+        let model = find_model(&local_model_dirs(), "text-recognition.onnx")
+            .expect("this test requires a local recognition model");
+        let engine = OcrEngine::new(OcrEngineParams {
+            recognition_model: Some(Model::load_file(model).unwrap()),
+            ..Default::default()
+        }).unwrap();
+        for (file, expected) in [
+            ("price-dark.rgb", "$164.21"), ("price-light.rgb", "$164.21"),
+            ("tiny-price.rgb", "$164.21"), ("sell-text.rgb", "Sell 1 NVDA"), ("zero.rgb", "0"),
+        ] {
+            let pixels = std::fs::read(directory.join(file)).unwrap();
+            let region = Region { x: 0, y: 0, width: 100, height: 28 };
+            let text = recognize_single_line(&engine, &region, &pixels).unwrap();
+            let actual = if expected.starts_with('$') {
+                text.split_whitespace().collect::<String>()
+            } else {
+                text.trim().to_owned()
+            };
+            assert_eq!(actual, expected, "{file}");
+        }
+    }
+
+    #[test]
+    fn numeric_enhancement_rejects_changed_digits_signs_or_existing_decimals() {
+        assert!(validate_numeric_readings("$16421", "$ 164.21").is_ok());
+        for (original, enhanced) in [
+            ("$16421", "$164.22"), ("-16421", "164.21"),
+            ("$164.21", "$16.421"), ("$164.21", "$16421"), ("$16421", "$$164.21"),
+        ] {
+            let error = validate_numeric_readings(original, enhanced).unwrap_err();
+            assert!(error.contains("Numeric OCR disagrees between scales"));
+        }
+    }
+
+    #[test]
     fn single_line_preparation_keeps_isolated_decimal_and_normalizes_polarity() {
         let mut dark = vec![0; 10 * 8 * 3];
         for (x, y) in [(3, 3), (6, 3), (6, 5)] {
@@ -285,6 +389,8 @@ mod tests {
         assert_eq!(prepare_single_line(&[255; 12], 2, 2).unwrap(), (vec![], 0, 0));
         assert!(prepare_single_line(&[0; 2], 2, 2).is_err());
         assert!(prepare_single_line(&[], 0, 0).is_err());
+        assert!(prepare_single_line(&[0], 1, 1).is_err());
+        assert!(prepare_single_line(&[0; 4], 1, 1).is_err());
     }
 
     #[test]

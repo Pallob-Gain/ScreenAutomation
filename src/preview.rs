@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Region};
+use crate::backend::{Backend, KeyAction, Region};
 use crate::graph::Graph;
 use crate::node::Value;
 use std::collections::HashMap;
@@ -38,12 +38,18 @@ impl PreviewSession {
         let node = self.graph.nodes[index].name.clone();
         let mut preview = PreviewBackend { backend, actions: Vec::new() };
         let (inputs, output) = self.graph.execute_node(index, &mut self.outputs, &mut preview, None, 0)?;
-        self.next += 1;
+        if !self.graph.nodes[index].is_waiting() {
+            self.next += 1;
+        }
         Ok(Some(StepResult { node, inputs, output, actions: preview.actions }))
     }
 
     pub fn is_finished(&self) -> bool {
         self.next == self.order.len()
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.graph.has_pending_waits()
     }
 }
 
@@ -73,5 +79,14 @@ impl Backend for PreviewBackend<'_> {
     fn click(&mut self, x: i32, y: i32, button: &str) -> Result<(), String> {
         self.actions.push(format!("click {button} at ({x}, {y})"));
         Ok(())
+    }
+
+    fn press_key(&mut self, key: KeyAction) -> Result<(), String> {
+        self.actions.push(format!("keypress {}", key.label()));
+        Ok(())
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.backend.now()
     }
 }

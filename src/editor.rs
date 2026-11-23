@@ -11,7 +11,9 @@ impl App {
             node_settings_open: false,
             copy_drag: None,
             add_menu_open: false,
+            group_dialog: None,
             running: false,
+            overlays_hidden: false,
             overlay_ready_at: None,
             last_tick: Instant::now(),
             last_run_duration: None,
@@ -251,6 +253,7 @@ impl App {
         if self.pending_file_action.is_some()
             || self.recovery.is_some()
             || self.recovery_error.is_some()
+            || self.group_dialog.is_some()
         {
             return;
         }
@@ -413,6 +416,11 @@ impl App {
                             .insert(step.node.clone(), (Instant::now(), value.to_text()));
                     }
                     self.preview_steps.push(step);
+                    if self.preview.as_ref().is_some_and(PreviewSession::is_waiting) {
+                        self.logs.record(log::Level::Info,
+                            format_args!("[PREVIEW] Waiting for screen text. Simulated actions do not change the screen; Step rechecks this wait."));
+                        break;
+                    }
                     if single_step {
                         break;
                     }
@@ -542,30 +550,34 @@ impl App {
             }
         }
         if let Some(index) = edit {
-            self.set_running(false);
-            if let Some(Node {
-                name,
-                kind: Kind::Subflow { graph },
-                ..
-            }) = self.graph.nodes.get(index)
-            {
-                let mut editor = App::new(None, String::new(), self.logs.clone());
-                editor.replace_graph((**graph).clone(), None);
-                editor.backend = self.backend.take();
-                editor.region_scales = self
-                    .region_scales
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        key.strip_prefix(&format!("{}/", region_key("", name)))
-                            .map(|key| (key.to_owned(), *value))
-                    })
-                    .collect();
-                self.subflow_editor = Some((name.clone(), Box::new(editor)));
-                self.node_settings_open = false;
-                self.preview_open = false;
-                self.validation_open = false;
-                self.search_open = false;
-            }
+            self.open_subflow(index);
+        }
+    }
+
+    pub(super) fn open_subflow(&mut self, index: usize) {
+        self.set_running(false);
+        if let Some(Node {
+            name,
+            kind: Kind::Subflow { graph },
+            ..
+        }) = self.graph.nodes.get(index)
+        {
+            let mut editor = App::new(None, String::new(), self.logs.clone());
+            editor.replace_graph((**graph).clone(), None);
+            editor.backend = self.backend.take();
+            editor.region_scales = self
+                .region_scales
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix(&format!("{}/", region_key("", name)))
+                        .map(|key| (key.to_owned(), *value))
+                })
+                .collect();
+            self.subflow_editor = Some((name.clone(), Box::new(editor)));
+            self.node_settings_open = false;
+            self.preview_open = false;
+            self.validation_open = false;
+            self.search_open = false;
         }
     }
 

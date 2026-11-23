@@ -7,10 +7,10 @@ use egui_snarl::{
     InPin, OutPin, Snarl,
 };
 use screen_automation::{
-    backend::{Backend, Region},
+    backend::{Backend, KeyAction, Region},
     desktop::Desktop,
     graph::{EventRuntime, Graph, GraphSettings, NodeEvent, RunMode, DEFAULT_REFRESH_MS},
-    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, Value},
+    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, TextMatch, Value},
     session_log::SessionLog,
     screen_events::{ScreenEvents, ScreenRegion},
     event_sources::{EventRegistration, EventSource, EventSources},
@@ -42,6 +42,13 @@ enum UnsavedChoice {
     Cancel,
 }
 
+struct GroupDialog {
+    name: String,
+    target_node: Option<String>,
+    error: Option<String>,
+    focus_name: bool,
+}
+
 struct App {
     graph: Graph,
     snarl: Snarl<usize>,
@@ -51,7 +58,9 @@ struct App {
     node_settings_open: bool,
     copy_drag: Option<egui_snarl::NodeId>,
     add_menu_open: bool,
+    group_dialog: Option<GroupDialog>,
     running: bool,
+    overlays_hidden: bool,
     overlay_ready_at: Option<Instant>,
     last_tick: Instant,
     last_run_duration: Option<Duration>,
@@ -95,7 +104,7 @@ struct App {
     logs_expanded: bool,
 }
 
-const KINDS: [&str; 16] = [
+const KINDS: [&str; 21] = [
     "ocr",
     "model",
     "function",
@@ -112,6 +121,19 @@ const KINDS: [&str; 16] = [
     "subflow",
     "subflow_input",
     "subflow_output",
+    "wait_for_text",
+    "assert_text",
+    "once",
+    "set_field",
+    "keypress",
+];
+const NODE_MENU_GROUPS: [(&str, &[&str]); 6] = [
+    ("Inputs", &["ocr", "event", "constant"]),
+    ("Data & validation", &["model", "function", "validate_number", "wait_for_text", "assert_text"]),
+    ("Logic", &["compare", "compare_inputs", "hysteresis", "threshold", "once"]),
+    ("Actions", &["click", "set_field", "keypress", "keyboard"]),
+    ("Subflows", &["subflow", "subflow_input", "subflow_output"]),
+    ("Notes", &["note"]),
 ];
 const GRAPH_ID: &str = "workflow-graph";
 const CANVAS_RESPONSE_ID: &str = "canvas-background-response";
@@ -188,32 +210,41 @@ fn paint_overlay(
     fill: Color32,
     outline: Color32,
     title: Color32,
-    running: bool,
+    selected: bool,
 ) -> egui::Rect {
     let capture_rect = overlay_capture_rect(rect);
-    if !running {
-        ui.painter().rect_filled(capture_rect, 0.0, fill);
-    }
+    ui.painter().rect_filled(capture_rect, 0.0, fill);
     ui.painter().rect_stroke(
         capture_rect.expand(4.0),
         0.0,
         egui::Stroke::new(2.0, outline),
         egui::StrokeKind::Inside,
     );
-    ui.painter().text(
-        capture_rect.left_top() - egui::vec2(0.0, 6.0),
-        egui::Align2::LEFT_BOTTOM,
-        name,
-        egui::FontId::proportional(14.0),
-        title,
+    if selected {
+        let header = egui::Rect::from_min_max(
+            rect.min + egui::vec2(2.0, 1.0),
+            egui::pos2(rect.right() - 2.0, capture_rect.top() - 1.0),
+        );
+        ui.painter().rect_filled(header, 2.0, NODE_SELECTED);
+    }
+    let text_color = if selected { Color32::BLACK } else { title };
+    let mut job = egui::text::LayoutJob::simple(
+        name.to_owned(), egui::FontId::proportional(10.0), text_color,
+        (rect.width() - 4.0).max(1.0),
     );
+    job.wrap.max_rows = 2;
+    for section in &mut job.sections {
+        section.format.line_height = Some(11.0);
+    }
+    let label = ui.painter().layout_job(job);
+    ui.painter().with_clip_rect(egui::Rect::from_min_max(
+        rect.min, egui::pos2(rect.right(), capture_rect.top()),
+    )).galley(rect.min + egui::vec2(2.0, 1.0), label, text_color);
     let grip = egui::Rect::from_min_size(
         capture_rect.right_bottom() - egui::vec2(18.0, 18.0),
         egui::vec2(18.0, 18.0),
     );
-    if !running {
-        ui.painter().rect_filled(grip, 2.0, outline);
-    }
+    ui.painter().rect_filled(grip, 2.0, outline);
     grip
 }
 
@@ -300,6 +331,8 @@ fn visit_nodes_mut(graph: &mut Graph, prefix: &str, visit: &mut impl FnMut(&mut 
 }
 
 struct OverlayState<'a> {
+    selected: Option<&'a str>,
+    clicked: Option<String>,
     scales: &'a mut HashMap<String, f32>,
     anchors: &'a mut HashMap<String, Region>,
     targets: &'a mut HashMap<String, (Region, u8)>,
@@ -336,29 +369,55 @@ const NODE_RADIUS: u8 = 5;
 const NODE_TEXT: Color32 = Color32::from_gray(51);
 const NODE_SELECTED: Color32 = Color32::from_rgb(255, 127, 14);
 
-/// Node-RED style palette and icon for each node type.
-fn node_style(kind: &Kind) -> (Color32, &'static str) {
-    match kind {
-        Kind::Ocr { .. } => (Color32::from_rgb(135, 192, 200), "👁"),
-        Kind::Model { .. } => (Color32::from_rgb(226, 162, 90), "#"),
-        Kind::Function { .. } => (Color32::from_rgb(253, 208, 162), "ƒ"),
-        Kind::Compare { .. } => (Color32::from_rgb(226, 217, 110), "⚖"),
-        Kind::CompareInputs { .. } => (Color32::from_rgb(226, 217, 110), "="),
-        Kind::Constant { .. } => (Color32::from_rgb(196, 180, 220), "#"),
-        Kind::Hysteresis { .. } => (Color32::from_rgb(215, 215, 160), "↕"),
-        Kind::Threshold { .. } => (Color32::from_rgb(170, 205, 160), "↕"),
-        Kind::Keyboard { .. } => (Color32::from_rgb(192, 184, 224), "⌨"),
-        Kind::Click { .. } => (Color32::from_rgb(166, 187, 207), "🖱"),
-        Kind::ValidateNumber { .. } => (Color32::from_rgb(130, 205, 170), "?"),
-        Kind::Event { .. } => (Color32::from_rgb(230, 170, 110), "!"),
-        Kind::Note { .. } => (Color32::from_rgb(245, 230, 150), "#"),
-        Kind::Subflow { .. } => (Color32::from_rgb(160, 170, 225), "{}"),
-        Kind::SubflowInput => (Color32::from_rgb(170, 195, 220), ">"),
-        Kind::SubflowOutput => (Color32::from_rgb(170, 195, 220), "<"),
-    }
+struct NodeStyle {
+    label: &'static str,
+    color: Color32,
+    icon: &'static str,
+}
+
+fn node_style(kind: &str) -> NodeStyle {
+    let (label, color, icon) = match kind {
+        "ocr" => ("OCR", Color32::from_rgb(135, 192, 200), "◎"),
+        "model" => ("Model", Color32::from_rgb(226, 162, 90), "#"),
+        "function" => ("Function", Color32::from_rgb(253, 208, 162), "ƒ"),
+        "compare" => ("Compare", Color32::from_rgb(226, 217, 110), "<>"),
+        "compare_inputs" => ("Compare inputs", Color32::from_rgb(226, 217, 110), "="),
+        "constant" => ("Constant", Color32::from_rgb(196, 180, 220), "#"),
+        "hysteresis" => ("Hysteresis", Color32::from_rgb(215, 215, 160), "~"),
+        "threshold" => ("Threshold", Color32::from_rgb(170, 205, 160), "|"),
+        "keyboard" => ("Keyboard", Color32::from_rgb(192, 184, 224), "⌨"),
+        "click" => ("Click", Color32::from_rgb(166, 187, 207), "+"),
+        "wait_for_text" => ("Wait for text", Color32::from_rgb(150, 195, 220), "…"),
+        "assert_text" => ("Assert text", Color32::from_rgb(130, 205, 170), "?"),
+        "once" => ("Once", Color32::from_rgb(230, 185, 140), "1"),
+        "set_field" => ("Set field", Color32::from_rgb(192, 184, 224), "ab"),
+        "keypress" => ("Keypress", Color32::from_rgb(192, 184, 224), ">"),
+        "validate_number" => ("Validate number", Color32::from_rgb(130, 205, 170), "#?"),
+        "event" => ("Event", Color32::from_rgb(230, 170, 110), "!"),
+        "note" => ("Note", Color32::from_rgb(245, 230, 150), "i"),
+        "subflow" => ("Subflow", Color32::from_rgb(160, 170, 225), "{}"),
+        "subflow_input" => ("Subflow input", Color32::from_rgb(170, 195, 220), ">"),
+        "subflow_output" => ("Subflow output", Color32::from_rgb(170, 195, 220), "<"),
+        _ => unreachable!("unknown node type: {kind}"),
+    };
+    NodeStyle { label, color, icon }
+}
+
+fn node_window_title(node: &Node) -> String {
+    let style = node_style(node.type_name());
+    format!("{} {} · {}", style.icon, style.label, node.display_title())
+}
+
+fn node_settings_title(node: &Node) -> String {
+    let style = node_style(node.type_name());
+    format!("{} {} · Node settings", style.icon, style.label)
 }
 
 fn node_label(node: &Node) -> String {
+    format!("{} · {}", node_style(node.type_name()).label, node_content_label(node))
+}
+
+fn node_content_label(node: &Node) -> String {
     let title = node.display_title();
     match &node.kind {
         Kind::Compare { op, value, .. } => {
@@ -392,6 +451,19 @@ fn node_label(node: &Node) -> String {
         },
         _ => title.to_owned(),
     }
+}
+
+fn canvas_node_label(painter: &egui::Painter, node: &Node) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&format!("{}\n", node_style(node.type_name()).label), 0.0, egui::TextFormat {
+        font_id: egui::FontId::proportional(10.0), color: NODE_TEXT,
+        ..Default::default()
+    });
+    job.append(&node_content_label(node), 0.0, egui::TextFormat {
+        font_id: egui::FontId::proportional(14.0), color: NODE_TEXT,
+        ..Default::default()
+    });
+    painter.layout_job(job)
 }
 
 fn node_description(node: &Node) -> String {
@@ -439,6 +511,11 @@ fn node_description(node: &Node) -> String {
         },
         Kind::Keyboard { .. } => "Type text into a screen region".into(),
         Kind::Click { .. } => "Click a screen region".into(),
+        Kind::WaitForText { expected, .. } => format!("Wait for screen text: {expected}"),
+        Kind::AssertText { expected, .. } => format!("Stop on unexpected screen text: {expected}"),
+        Kind::Once { armed, fired } => format!("Once gate: {}", if *fired { "latched" } else if *armed { "armed" } else { "disarmed" }),
+        Kind::SetField { .. } => "Select all and replace a field; verify with Wait for text".into(),
+        Kind::Keypress { key } => format!("Press {}", key.label()),
         Kind::ValidateNumber { .. } => "Reject invalid numeric/OCR readings before they reach actions".into(),
         Kind::Event { event } => format!("Event source: {}", event.label()),
         Kind::Note { text } => text.clone(),
@@ -612,8 +689,36 @@ fn new_kind(i: usize) -> Kind {
             Kind::Subflow { graph: Box::new(graph) }
         }
         14 => Kind::SubflowInput,
+        16 => Kind::WaitForText {
+            expected: String::new(), matching: TextMatch::Contains, case_sensitive: false,
+            single_line: false, timeout_ms: 10_000, poll_ms: 100, pending: None,
+        },
+        17 => Kind::AssertText {
+            expected: String::new(), matching: TextMatch::Contains, case_sensitive: false, single_line: false,
+        },
+        18 => Kind::Once { armed: false, fired: false },
+        19 => Kind::SetField { text: String::new() },
+        20 => Kind::Keypress { key: KeyAction::Tab },
         _ => Kind::SubflowOutput,
     }
+}
+
+fn text_condition_settings(
+    ui: &mut egui::Ui, expected: &mut String, matching: &mut TextMatch,
+    case_sensitive: &mut bool, single_line: &mut bool,
+) -> bool {
+    let before = (expected.clone(), *matching, *case_sensitive, *single_line);
+    ui.label("Expected screen text");
+    ui.text_edit_singleline(expected);
+    egui::ComboBox::from_id_salt("text-match-mode").selected_text(matching.label()).show_ui(ui, |ui| {
+        for choice in TextMatch::ALL {
+            ui.selectable_value(matching, choice, choice.label());
+        }
+    });
+    ui.checkbox(case_sensitive, "Case sensitive");
+    ui.checkbox(single_line, "Single-line OCR");
+    ui.weak("Whitespace is normalized. Successful checks pass the original trigger onward.");
+    before != (expected.clone(), *matching, *case_sensitive, *single_line)
 }
 
 fn format_settings(ui: &mut egui::Ui, format: &mut Format) {
@@ -663,7 +768,7 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         snarl: &Snarl<usize>,
     ) -> egui::Frame {
         let index = snarl[node];
-        let frame = default.fill(node_style(&self.graph.nodes[index].kind).0);
+        let frame = default.fill(node_style(self.graph.nodes[index].type_name()).color);
         if self.validation.iter().any(|issue| issue.node.as_deref() == Some(&self.graph.nodes[index].name)) {
             frame.stroke(egui::Stroke::new(2.0, Color32::RED))
         } else if self.selected == Some(index) {
@@ -749,17 +854,13 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         if let Kind::Note { text } = &node.kind {
             ui.vertical(|ui| {
                 ui.set_width(240.0);
-                ui.strong(node.display_title());
+                ui.strong(node_window_title(node));
                 ui.label(text);
             });
             return;
         }
-        let (_, icon) = node_style(&node.kind);
-        let label = ui.painter().layout_no_wrap(
-            node_label(node),
-            egui::FontId::proportional(14.0),
-            NODE_TEXT,
-        );
+        let icon = node_style(node.type_name()).icon;
+        let label = canvas_node_label(ui.painter(), node);
         let icon_width = node_icon_width(ui.painter(), node);
         let width = (icon_width + label.size().x + 24.0).max(NODE_MIN_WIDTH);
         let height = NODE_HEIGHT * inputs.len().max(1) as f32;
@@ -944,10 +1045,11 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
 fn canvas_node_size(painter: &egui::Painter, node: &Node) -> egui::Vec2 {
     let font = egui::FontId::proportional(14.0);
     if let Kind::Note { text } = &node.kind {
+        let header = painter.layout(node_window_title(node), font.clone(), NODE_TEXT, 240.0);
         let text = painter.layout(text.clone(), font, NODE_TEXT, 240.0);
-        return egui::vec2(260.0, text.size().y + 40.0);
+        return egui::vec2(260.0, text.size().y + header.size().y + 24.0);
     }
-    let label = painter.layout_no_wrap(node_label(node), font, NODE_TEXT);
+    let label = canvas_node_label(painter, node);
     egui::vec2((node_icon_width(painter, node) + label.size().x + 24.0).max(NODE_MIN_WIDTH) + 10.0,
         NODE_HEIGHT * node.input_count().max(1) as f32 + 10.0)
 }
@@ -1006,6 +1108,7 @@ impl App {
         self.selected = None;
         self.node_settings_open = false;
         self.add_menu_open = false;
+        self.group_dialog = None;
         self.region_scales.clear();
         self.activity.clear();
         self.overlay_anchors.clear();
@@ -1473,7 +1576,10 @@ impl App {
         if let Some(backend) = self.backend.as_mut() {
             match run_with_physical_regions(&mut self.graph, backend, &self.region_scales) {
                 Ok(outputs) => self.record_outputs(outputs),
-                Err(error) => self.record_status(log::Level::Error, error),
+                Err(error) => {
+                    self.set_running(false);
+                    self.record_status(log::Level::Error, error);
+                }
             }
         } else {
             self.record_status(log::Level::Error, "Desktop backend is unavailable".into());
@@ -1568,7 +1674,7 @@ impl App {
             Some(events) => events.take_pending()?,
             None => Vec::new(),
         };
-        if frames.is_empty() && events.is_empty() {
+        if frames.is_empty() && events.is_empty() && !self.graph.has_pending_waits() {
             return Ok(());
         }
         let start = Instant::now();
@@ -1593,7 +1699,11 @@ impl App {
         }
         self.last_tick = start;
         self.last_run_duration = Some(start.elapsed());
-        ctx.request_repaint();
+        if self.graph.has_pending_waits() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            ctx.request_repaint();
+        }
         Ok(())
     }
 
@@ -1610,11 +1720,15 @@ impl App {
         let mut open = true;
         let mut delete = false;
         let mut parameter_changes = Vec::new();
+        let mut screen_action_changed = false;
+        let groups: Vec<_> = self.graph.group_names().into_iter().map(str::to_owned).collect();
+        let mut selected_group = self.graph.nodes[index].group.clone();
+        let mut create_group = false;
         let popup_clicked = egui::Popup::is_any_open(ctx)
             && ctx.pointer_interact_pos()
                 .and_then(|pos| ctx.layer_id_at(pos))
                 .is_some_and(|layer| layer.order == egui::Order::Foreground);
-        let window = egui::Window::new("Node settings")
+        let window = egui::Window::new(node_settings_title(&self.graph.nodes[index]))
             .id(Id::new("node-settings"))
             .open(&mut open)
             .show(ctx, |settings| {
@@ -1630,7 +1744,26 @@ impl App {
                 settings.weak(node.type_name());
                 settings.horizontal(|ui| {
                     ui.label("Group");
-                    ui.text_edit_singleline(&mut node.group);
+                    let picker = egui::ComboBox::from_id_salt(("node-group", index))
+                        .selected_text(if selected_group.is_empty() { "Ungrouped" } else { &selected_group })
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_value(&mut selected_group, String::new(), "Ungrouped").clicked() {
+                                ui.close();
+                            }
+                            for name in &groups {
+                                if ui.selectable_value(&mut selected_group, name.clone(), name).clicked() {
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Create new group...").clicked() {
+                                create_group = true;
+                                ui.close();
+                            }
+                        });
+                    ui.ctx().data_mut(|data| data.insert_temp(
+                        Id::new(("node-group-picker-rect", index)), picker.response.rect,
+                    ));
                 });
                 settings.separator();
                 if !node.available_input_parameters().is_empty() {
@@ -1793,6 +1926,49 @@ impl App {
                         settings.label("Mouse button");
                         settings.text_edit_singleline(button);
                     }
+                    Kind::WaitForText { expected, matching, case_sensitive, single_line, timeout_ms, poll_ms, pending } => {
+                        let before_timing = (*timeout_ms, *poll_ms);
+                        let changed = text_condition_settings(settings, expected, matching, case_sensitive, single_line);
+                        settings.horizontal(|ui| {
+                            ui.label("Timeout (ms)");
+                            ui.add(egui::DragValue::new(timeout_ms).range(1..=120_000));
+                        });
+                        settings.horizontal(|ui| {
+                            ui.label("Minimum poll interval (ms)");
+                            ui.add(egui::DragValue::new(poll_ms).range(1..=120_000));
+                        });
+                        settings.weak("Non-blocking; rechecks on workflow ticks. HMI schedules idle rechecks every 50 ms. Timeout stops the run. Top-level graphs only. Stop cancels pending waits.");
+                        if changed || before_timing != (*timeout_ms, *poll_ms) {
+                            *pending = None;
+                            screen_action_changed = true;
+                        }
+                    }
+                    Kind::AssertText { expected, matching, case_sensitive, single_line } => {
+                        screen_action_changed |= text_condition_settings(settings, expected, matching, case_sensitive, single_line);
+                        settings.weak("Checks immediately. A mismatch stops the workflow; use Wait for text for transitions.");
+                    }
+                    Kind::Once { armed, fired } => {
+                        settings.add_enabled(!self.running, egui::Checkbox::new(armed, "Armed"));
+                        settings.label(if *fired { "Latched: further triggers are blocked." } else { "Not yet triggered." });
+                        if settings.add_enabled(!self.running, egui::Button::new("Reset latch (after checking order history)")).clicked() {
+                            *fired = false;
+                            log::info!("[ONCE] Manual reset requested");
+                        }
+                        settings.weak("Passes one trigger. Stop/Run does not reset the latch. Loading, duplicating or explicitly resetting runtime does. Never rearm after a submission timeout until you check order history.");
+                    }
+                    Kind::SetField { text } => {
+                        settings.label("Replacement text (empty uses input)");
+                        screen_action_changed |= settings.text_edit_singleline(text).changed();
+                        settings.weak("Clicks the field, selects all, then types replacement text. Follow with Wait for text to verify the value before submitting.");
+                    }
+                    Kind::Keypress { key } => {
+                        let before = *key;
+                        egui::ComboBox::from_id_salt("keypress-key").selected_text(key.label()).show_ui(settings, |ui| {
+                            for choice in KeyAction::ALL { ui.selectable_value(key, choice, choice.label()); }
+                        });
+                        screen_action_changed |= before != *key;
+                        settings.weak("Acts on the currently focused control; connect after a Click or Set field node.");
+                    }
                     Kind::Ocr { single_line, last_hash } => {
                         settings.label("Reads text from its screen region.");
                         if settings.checkbox(single_line, "Single line (prices / numbers)").changed() {
@@ -1851,7 +2027,17 @@ impl App {
             *node == index && ctx.read_response(node_frame_id(id))
                 .is_some_and(|response| response.contains_pointer())
         });
-        let clicked_outside = window.is_some_and(|window| window.response.clicked_elsewhere())
+        if selected_group != self.graph.nodes[index].group {
+            let name = self.graph.nodes[index].name.clone();
+            if let Err(error) = self.graph.assign_group(&name, &selected_group) {
+                self.record_status(log::Level::Error, error);
+            }
+        }
+        if create_group {
+            self.open_group_dialog(Some(self.graph.nodes[index].name.clone()));
+        }
+        let clicked_outside = self.group_dialog.is_none()
+            && window.is_some_and(|window| window.response.clicked_elsewhere())
             && !selected_node_clicked
             && !popup_clicked;
         if delete {
@@ -1859,6 +2045,11 @@ impl App {
         } else if !open || clicked_outside {
             self.selected = None;
             self.node_settings_open = false;
+        }
+        if screen_action_changed && self.running {
+            self.set_running(false);
+            self.record_status(log::Level::Info,
+                "Screen action settings changed. Pending waits cancelled; review the workflow before running again.".into());
         }
         if !delete && !parameter_changes.is_empty() {
             self.sync_graph_positions();
@@ -1874,6 +2065,72 @@ impl App {
             self.record_status(log::Level::Info, "Updated input pins; connect each required setting before running".into());
         }
         self.handle_subflow_requests(ctx);
+    }
+
+    fn open_group_dialog(&mut self, target_node: Option<String>) {
+        self.add_menu_open = false;
+        self.group_dialog = Some(GroupDialog {
+            name: String::new(), target_node, error: None, focus_name: true,
+        });
+    }
+
+    fn create_group(&mut self, name: &str, target_node: Option<&str>) -> Result<(), String> {
+        let target = target_node.map(|name| self.graph.nodes.iter()
+            .position(|node| node.name == name)
+            .ok_or_else(|| format!("Cannot assign group: node {name:?} no longer exists.")))
+            .transpose()?;
+        let name = self.graph.add_group(name)?;
+        if let Some(index) = target {
+            let node = self.graph.nodes[index].name.clone();
+            self.graph.assign_group(&node, &name)?;
+        }
+        self.record_status(log::Level::Info, format!("Created group {name:?}"));
+        Ok(())
+    }
+
+    fn show_group_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.group_dialog else { return };
+        let mut create = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::new("create-group")).show(ctx, |ui| {
+            ui.heading("Create group");
+            ui.label("Group name");
+            let name = ui.add(egui::TextEdit::singleline(&mut dialog.name)
+                .id(Id::new("new-group-name")));
+            if dialog.focus_name {
+                name.request_focus();
+                dialog.focus_name = false;
+            }
+            if name.changed() { dialog.error = None; }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            if dialog.target_node.is_some() {
+                ui.weak("The selected node will be assigned to this group.");
+            } else {
+                ui.weak("Assign nodes using their Group dropdown. Empty groups appear on the canvas after a node is assigned.");
+            }
+            ui.horizontal(|ui| {
+                create = ui.button("Create").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel || response.should_close() {
+            self.group_dialog = None;
+        } else if create {
+            let name = dialog.name.clone();
+            let target = dialog.target_node.clone();
+            if let Err(error) = self.create_group(&name, target.as_deref()) {
+                self.group_dialog.as_mut().expect("group dialog is open").error = Some(error);
+            } else {
+                self.group_dialog = None;
+            }
+        }
+    }
+
+    fn group_dialog_open(&self) -> bool {
+        self.group_dialog.is_some()
+            || self.subflow_editor.as_ref().is_some_and(|(_, editor)| editor.group_dialog_open())
     }
 
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
@@ -1969,44 +2226,71 @@ impl App {
             });
         if self.add_menu_open {
             let mut selected_kind = None;
+            let mut create_group = false;
             egui::Area::new(Id::new("canvas-add-menu"))
                 .order(egui::Order::Foreground)
                 .pivot(egui::Align2::RIGHT_TOP)
                 .fixed_pos(canvas_rect.right_top() + egui::vec2(-12.0, 64.0))
                 .show(&ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_height((canvas_rect.height() - 150.0).max(100.0)).show(ui, |ui| {
-                        for (index, kind) in KINDS.iter().enumerate() {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(170.0, 30.0), egui::Sense::hover());
-                            let response = ui.interact(
-                                rect,
-                                Id::new(("canvas-add-kind", index)),
-                                egui::Sense::click(),
-                            );
-                            ui.ctx().data_mut(|data| {
-                                data.insert_temp(Id::new(("canvas-add-kind-rect", index)), rect);
-                            });
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::CornerRadius::same(3),
-                                if response.hovered() {
-                                    ui.visuals().widgets.hovered.bg_fill
-                                } else {
-                                    ui.visuals().widgets.inactive.bg_fill
-                                },
-                            );
-                            ui.painter().text(
-                                rect.left_center() + egui::vec2(8.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                kind.replace('_', " "),
-                                egui::FontId::proportional(14.0),
-                                ui.visuals().text_color(),
-                            );
-                            if response.clicked() {
-                                selected_kind = Some(index);
+                        egui::ScrollArea::vertical()
+                            .max_height((canvas_rect.height() - 150.0).max(100.0))
+                            .show(ui, |ui| {
+                            let create = ui.add_sized([210.0, 30.0], egui::Button::new("+ Create group..."));
+                            ui.ctx().data_mut(|data| data.insert_temp(
+                                Id::new("canvas-create-group-rect"), create.rect,
+                            ));
+                            create_group = create.clicked();
+                            ui.separator();
+                            for (group_index, (group, kinds)) in NODE_MENU_GROUPS.iter().enumerate() {
+                                if group_index > 0 {
+                                    ui.separator();
+                                }
+                                ui.strong(*group);
+                                for kind in *kinds {
+                                    let index = KINDS.iter().position(|candidate| candidate == kind)
+                                        .expect("menu entries must name a supported node type");
+                                    let style = node_style(kind);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(210.0, 30.0), egui::Sense::hover(),
+                                    );
+                                    let response = ui.interact(
+                                        rect, Id::new(("canvas-add-kind", index)), egui::Sense::click(),
+                                    );
+                                    response.widget_info(|| egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button, ui.is_enabled(),
+                                        format!("{} {}", style.icon, style.label),
+                                    ));
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(Id::new(("canvas-add-kind-rect", index)), rect);
+                                    });
+                                    ui.painter().rect_filled(
+                                        rect, egui::CornerRadius::same(3),
+                                        if response.hovered() {
+                                            ui.visuals().widgets.hovered.bg_fill
+                                        } else {
+                                            ui.visuals().widgets.inactive.bg_fill
+                                        },
+                                    );
+                                    let icon_center = rect.left_center() + egui::vec2(17.0, 0.0);
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_center_size(icon_center, egui::vec2(22.0, 22.0)),
+                                        3.0, style.color,
+                                    );
+                                    ui.painter().text(
+                                        icon_center, egui::Align2::CENTER_CENTER,
+                                        style.icon, egui::FontId::proportional(14.0), NODE_TEXT,
+                                    );
+                                    ui.painter().text(
+                                        rect.left_center() + egui::vec2(36.0, 0.0),
+                                        egui::Align2::LEFT_CENTER, style.label,
+                                        egui::FontId::proportional(14.0), ui.visuals().text_color(),
+                                    );
+                                    if response.clicked() {
+                                        selected_kind = Some(index);
+                                    }
+                                }
                             }
-                        }
                         });
                     });
                 });
@@ -2014,6 +2298,9 @@ impl App {
                 self.kind = index;
                 self.add_node();
                 self.add_menu_open = false;
+            }
+            if create_group {
+                self.open_group_dialog(None);
             }
         }
 
@@ -2070,25 +2357,84 @@ impl App {
         }
         self.sync_graph_positions();
         self.show_settings(&ctx);
+        self.show_group_dialog(&ctx);
+    }
+
+    fn selected_overlay_key(&self) -> Option<String> {
+        if let Some((name, editor)) = &self.subflow_editor {
+            return editor.selected_overlay_key()
+                .map(|key| format!("{}/{key}", region_key("", name)));
+        }
+        self.selected.and_then(|index| self.graph.nodes.get(index))
+            .filter(|node| node.region.is_some())
+            .map(|node| region_key("", &node.name))
+    }
+
+    fn select_overlay_key(&mut self, key: &str) -> Result<(), String> {
+        let (name, child) = key.split_once('/').map_or((key, None), |(name, child)| (name, Some(child)));
+        let index = self.graph.nodes.iter().position(|node| region_key("", &node.name) == name)
+            .ok_or_else(|| format!("Region window has no corresponding node: {key}"))?;
+        if let Some(child) = child {
+            if !matches!(self.graph.nodes[index].kind, Kind::Subflow { .. }) {
+                return Err(format!("Region window path is not a subflow: {key}"));
+            }
+            if self.subflow_editor.as_ref().map(|(name, _)| name) != Some(&self.graph.nodes[index].name) {
+                self.leave_subflows();
+                self.open_subflow(index);
+            }
+            return self.subflow_editor.as_mut()
+                .ok_or_else(|| format!("Could not open region window's subflow: {key}"))?
+                .1.select_overlay_key(child);
+        }
+        let changing_graph = self.subflow_editor.is_some();
+        self.leave_subflows();
+        if changing_graph || self.selected != Some(index) {
+            self.node_settings_open = false;
+            self.focus_node = Some(self.graph.nodes[index].name.clone());
+        }
+        self.selected = Some(index);
+        Ok(())
     }
 
     fn show_overlays(&mut self, ctx: &egui::Context) {
         let running = self.running;
-        let locked = self.pending_file_action.is_some() || self.recovery.is_some() || self.recovery_error.is_some();
-        let mut state = OverlayState {
-            scales: &mut self.region_scales,
-            anchors: &mut self.overlay_anchors,
-            targets: &mut self.overlay_targets,
+        let visibility_changed = self.overlays_hidden != running;
+        let locked = self.pending_file_action.is_some() || self.recovery.is_some()
+            || self.recovery_error.is_some() || self.group_dialog_open();
+        let selected = self.selected_overlay_key();
+        let clicked = {
+            let mut state = OverlayState {
+                selected: selected.as_deref(),
+                clicked: None,
+                scales: &mut self.region_scales,
+                anchors: &mut self.overlay_anchors,
+                targets: &mut self.overlay_targets,
+            };
+            visit_nodes_mut(&mut self.graph, "", &mut |node, key| {
+                Self::overlay_node(ctx, node, key, running, locked, &mut state);
+            });
+            state.clicked
         };
-        visit_nodes_mut(&mut self.graph, "", &mut |node, key| {
-            Self::overlay_node(ctx, node, key, running, locked, &mut state);
-        });
+        if let Some(key) = clicked {
+            if let Err(error) = self.select_overlay_key(&key) {
+                self.record_status(log::Level::Error, error);
+            }
+            ctx.request_repaint();
+        }
+        if visibility_changed {
+            self.overlays_hidden = running;
+            self.overlay_ready_at = running.then(|| Instant::now() + OVERLAY_SETTLE_DELAY);
+            ctx.request_repaint();
+        }
     }
 
     fn overlay_node(ctx: &egui::Context, node: &mut Node, key: &str, running: bool, locked: bool, state: &mut OverlayState<'_>) {
         let Some(region) = node.region else {
             return;
         };
+        if running && ctx.embed_viewports() {
+            return;
+        }
         // The builder position/size must stay constant: egui re-applies any change to it as a
         // window move, and feeding the measured region back in makes the window creep each frame.
         let anchor = match state.anchors.get(key) {
@@ -2102,7 +2448,8 @@ impl App {
         };
         let id = ViewportId::from_hash_of(("overlay", key));
         let builder = ViewportBuilder::default()
-            .with_title(node.display_title())
+            .with_title(node_window_title(node))
+            .with_visible(!running)
             .with_decorations(false)
             .with_transparent(true)
             .with_has_shadow(false)
@@ -2124,15 +2471,18 @@ impl App {
         let outline = Color32::from_rgba_unmultiplied(255, 40, 40, alpha);
         let title = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
         let name = key.to_owned();
-        let label = node.display_title().to_owned();
+        let style = node_style(node.type_name());
+        let label = format!("{} {}\n{}", style.icon, style.label, node.display_title());
+        let selected = state.selected == Some(key);
         ctx.show_viewport_immediate(id, builder, |ctx, _| {
+            if running { return; }
             let viewport_ctx = ctx.clone();
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
                     let rect = ui.max_rect();
-                    let grip = paint_overlay(ui, rect, &label, fill, outline, title, running);
-                    let drag = ui.interact(rect, ui.id().with("move-overlay"), egui::Sense::drag());
+                    let grip = paint_overlay(ui, rect, &label, fill, outline, title, selected);
+                    let drag = ui.interact(rect, ui.id().with("move-overlay"), egui::Sense::click_and_drag());
                     if drag.drag_started()
                         && drag
                             .interact_pointer_pos()
@@ -2142,6 +2492,9 @@ impl App {
                     }
                     let resize =
                         ui.interact(grip, ui.id().with("resize-grip"), egui::Sense::drag());
+                    if !locked && (drag.clicked() || drag.drag_started() || resize.drag_started()) {
+                        state.clicked = Some(name.clone());
+                    }
                     let start_size_id = Id::new(("overlay-resize-start", &name));
                     let start_pos_id = Id::new(("overlay-resize-start-pos", &name));
                     if resize.drag_started() {
@@ -2177,6 +2530,7 @@ impl App {
                 });
         });
 
+        if running { return; }
         let (inner, outer, scale) = ctx.input_for(id, |input| {
             let viewport = input.viewport();
             (viewport.inner_rect, viewport.outer_rect, input.pixels_per_point)
@@ -2316,6 +2670,7 @@ impl App {
         }
         self.running = running;
         if !running {
+            self.graph.cancel_waits();
             if let Some(mut events) = self.screen_events.take() {
                 if let Err(error) = events.stop() {
                     self.record_status(log::Level::Error, format!("Could not stop screen events: {error}"));
@@ -2459,6 +2814,176 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
 
+    fn group_ui_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> HashMap<String, Pos2> {
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 900.0))),
+            events, ..Default::default()
+        }, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.show_canvas(ui));
+            app.capture_history(ui.ctx());
+        });
+        output.textures_delta.clear();
+        output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((
+                text.galley.job.text.clone(), text.pos + text.galley.size() * 0.5,
+            )),
+            _ => None,
+        }).collect()
+    }
+
+    fn group_ui_click(ctx: &egui::Context, app: &mut App, pos: Pos2) {
+        group_ui_frame(ctx, app, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+        group_ui_frame(ctx, app, vec![button(pos, false)]);
+    }
+
+    #[test]
+    fn creation_menu_creates_an_empty_group_and_undo_restores_it() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.add_menu_open = true;
+        group_ui_frame(&ctx, &mut app, vec![]);
+        let text = group_ui_frame(&ctx, &mut app, vec![]);
+        group_ui_click(&ctx, &mut app, text["+ Create group..."]);
+        assert!(app.group_dialog.is_some());
+        assert!(!app.add_menu_open);
+        group_ui_frame(&ctx, &mut app, vec![]);
+        let text = group_ui_frame(&ctx, &mut app, vec![egui::Event::Text(" Review ".into())]);
+        group_ui_click(&ctx, &mut app, text["Create"]);
+        assert!(app.group_dialog.is_none());
+        assert_eq!(app.graph.group_names(), ["Review"]);
+        assert!(app.graph.nodes.is_empty());
+        app.capture_history(&ctx);
+        assert!(app.has_unsaved_changes());
+        app.undo_edit(&ctx, false);
+        assert!(app.graph.group_names().is_empty());
+        app.undo_edit(&ctx, true);
+        assert_eq!(app.graph.group_names(), ["Review"]);
+    }
+
+    #[test]
+    fn group_dropdown_selects_legacy_groups_creates_assigns_and_ungroups() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.add_node();
+        app.graph.nodes[0].group = "Ticket".into();
+        app.create_group("Review", None).unwrap();
+        app.selected = Some(0);
+        app.node_settings_open = true;
+        let open_picker = |app: &mut App| {
+            group_ui_frame(&ctx, app, vec![]);
+            group_ui_frame(&ctx, app, vec![]);
+            let rect = ctx.data(|data| data.get_temp::<egui::Rect>(
+                Id::new(("node-group-picker-rect", 0usize)),
+            ).unwrap());
+            group_ui_click(&ctx, app, rect.center());
+            group_ui_frame(&ctx, app, vec![]);
+            group_ui_frame(&ctx, app, vec![])
+        };
+        let text = open_picker(&mut app);
+        assert!(text.contains_key("Ticket"));
+        group_ui_click(&ctx, &mut app, text["Review"]);
+        assert_eq!(app.graph.nodes[0].group, "Review");
+        assert!(app.node_settings_open);
+        let text = open_picker(&mut app);
+        group_ui_click(&ctx, &mut app, text["Create new group..."]);
+        assert!(app.group_dialog.is_some());
+        group_ui_frame(&ctx, &mut app, vec![]);
+        let text = group_ui_frame(&ctx, &mut app, vec![egui::Event::Text("ticket".into())]);
+        group_ui_click(&ctx, &mut app, text["Create"]);
+        assert!(app.group_dialog.as_ref().unwrap().error.as_ref().unwrap().contains("already exists"));
+        assert_eq!(app.graph.nodes[0].group, "Review");
+        app.group_dialog.as_mut().unwrap().name = "Execution".into();
+        let text = group_ui_frame(&ctx, &mut app, vec![]);
+        group_ui_click(&ctx, &mut app, text["Create"]);
+        assert!(app.group_dialog.is_none());
+        assert_eq!(app.graph.nodes[0].group, "Execution");
+        assert!(app.node_settings_open);
+        let text = open_picker(&mut app);
+        group_ui_click(&ctx, &mut app, text["Ungrouped"]);
+        assert!(app.graph.nodes[0].group.is_empty());
+        assert_eq!(app.graph.group_names(), ["Execution", "Review", "Ticket"]);
+    }
+
+    #[test]
+    fn typed_overlay_titles_fit_without_changing_capture_or_custom_titles() {
+        let ctx = egui::Context::default();
+        let window = egui::Rect::from_min_size(Pos2::ZERO, overlay_min_inner_size());
+        let mut missing = Vec::new();
+        let mut font_output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for kind in KINDS {
+                if !ui.fonts_mut(|fonts| fonts.has_glyphs(
+                    &egui::FontId::proportional(14.0), node_style(kind).icon,
+                )) {
+                    missing.push(kind);
+                }
+            }
+        });
+        font_output.textures_delta.clear();
+        assert!(missing.is_empty(), "unsupported icons: {missing:?}");
+        for (index, kind) in KINDS.iter().enumerate() {
+            let mut node = Node::new("stable-name", new_kind(index));
+            node.title = "Custom title longer than the narrow region window".into();
+            let style = node_style(kind);
+            let heading = format!("{} {}", style.icon, style.label);
+            assert_eq!(node.type_name(), *kind);
+            let label = format!("{heading}\n{}", node.display_title());
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(window), ..Default::default()
+            }, |ui| {
+                if !matches!(node.kind, Kind::Note { .. }) {
+                    assert!(canvas_node_label(ui.painter(), &node).size().y <= NODE_HEIGHT);
+                }
+                paint_overlay(ui, window, &label, Color32::TRANSPARENT,
+                    Color32::TRANSPARENT, Color32::TRANSPARENT, true);
+            });
+            output.textures_delta.clear();
+            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            }).unwrap();
+            assert_eq!(text.galley.rows.len(), 2, "{kind}");
+            assert_eq!(text.galley.rows[0].glyphs.iter().map(|glyph| glyph.chr).collect::<String>(),
+                heading, "the node type must not be truncated");
+            assert!(text.pos.y + text.galley.size().y < overlay_capture_rect(window).top());
+            assert!(node_window_title(&node).ends_with(&node.title));
+            assert!(node_label(&node).contains(&node.title));
+            assert_eq!(capture_region(window).width, 80);
+            assert_eq!(node.name, "stable-name");
+        }
+    }
+
+    #[test]
+    fn grouped_creation_menu_keeps_kind_identity_and_settings_show_it() {
+        let mut entries: Vec<_> = NODE_MENU_GROUPS.iter()
+            .flat_map(|(_, kinds)| kinds.iter().copied()).collect();
+        entries.sort_unstable();
+        let mut supported = KINDS.to_vec();
+        supported.sort_unstable();
+        assert_eq!(entries, supported, "each supported node must appear exactly once");
+
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.add_menu_open = true;
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        let index = KINDS.iter().position(|kind| *kind == "constant").unwrap();
+        let choice = ctx.data(|data| data.get_temp::<egui::Rect>(
+            Id::new(("canvas-add-kind-rect", index)),
+        ).unwrap()).center();
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(choice), button(choice, true)]);
+        frame(&ctx, &mut app, vec![button(choice, false)]);
+        assert!(matches!(app.graph.nodes[0].kind, Kind::Constant { .. }));
+        app.selected = Some(0);
+        app.node_settings_open = true;
+        let mut initial = ctx.run_ui(egui::RawInput::default(), |ui| app.show_settings(ui.ctx()));
+        initial.textures_delta.clear();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_settings(ui.ctx()));
+        output.textures_delta.clear();
+        let expected = node_settings_title(&app.graph.nodes[0]);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.job.text == expected)));
+    }
+
     #[test]
     fn overlay_title_and_outline_are_outside_capture_region() {
         let window = egui::Rect::from_min_size(Pos2::new(94.0, 76.0), egui::vec2(312.0, 150.0));
@@ -2514,11 +3039,11 @@ mod tests {
     }
 
     #[test]
-    fn running_overlay_leaves_capture_region_clear() {
+    fn stopped_overlay_keeps_label_and_outline_outside_capture_region() {
         let ctx = egui::Context::default();
         let window = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(312.0, 150.0));
         let capture = overlay_capture_rect(window);
-        for running in [false, true] {
+        {
             let input = egui::RawInput {
                 screen_rect: Some(window),
                 ..Default::default()
@@ -2531,7 +3056,7 @@ mod tests {
                     Color32::BLUE,
                     Color32::RED,
                     Color32::BLACK,
-                    running,
+                    false,
                 );
             });
             let rects: Vec<_> = output
@@ -2556,13 +3081,13 @@ mod tests {
                     }
                 })
                 .collect();
-            assert_eq!(rects.len(), if running { 1 } else { 3 });
+            assert_eq!(rects.len(), 3);
             assert_eq!(
                 rects
                     .iter()
                     .filter(|rect| rect.fill == Color32::BLUE)
                     .count(),
-                usize::from(!running)
+                1
             );
             let outline = rects
                 .iter()
@@ -2572,6 +3097,174 @@ mod tests {
             assert_eq!(texts.len(), 1);
             assert!(texts[0].pos.y + texts[0].galley.size().y < capture.top());
             output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn selected_overlay_header_stays_readable_at_zero_opacity_without_covering_capture() {
+        let ctx = egui::Context::default();
+        let window = egui::Rect::from_min_size(Pos2::ZERO, overlay_min_inner_size());
+        let capture = overlay_capture_rect(window);
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(window), ..Default::default()
+        }, |ui| {
+            paint_overlay(ui, window, "ocr1", Color32::TRANSPARENT,
+                Color32::TRANSPARENT, Color32::TRANSPARENT, true);
+        });
+        output.textures_delta.clear();
+        let header = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Rect(rect) if rect.fill == NODE_SELECTED => Some(rect),
+            _ => None,
+        }).expect("selected overlay must have an opaque highlight");
+        assert_eq!(header.fill.a(), 255);
+        assert!(window.contains_rect(header.rect));
+        assert!(header.rect.bottom() < capture.top());
+        let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text),
+            _ => None,
+        }).unwrap();
+        assert!(text.galley.job.sections.iter().all(|section| section.format.color == Color32::BLACK));
+        assert!(header.rect.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())));
+    }
+
+    #[test]
+    fn overlay_selection_follows_scoped_keys_across_nested_editors() {
+        let mut leaf = Graph::default();
+        leaf.add_node(Node::new("same/~", Kind::Ocr { single_line: false, last_hash: None })).unwrap();
+        let mut middle = Graph::default();
+        middle.add_node(Node::new("inner/one", Kind::Subflow { graph: Box::new(leaf) })).unwrap();
+        let mut app = app();
+        app.graph.add_node(Node::new("same/~", Kind::Ocr { single_line: false, last_hash: None })).unwrap();
+        app.graph.add_node(Node::new("outer~", Kind::Subflow { graph: Box::new(middle) })).unwrap();
+        let original = app.graph.to_json();
+        let nested_key = "outer~0/inner~1one/same~1~0";
+        app.select_overlay_key(nested_key).unwrap();
+        assert_eq!(app.selected_overlay_key().as_deref(), Some(nested_key));
+        let inner = &app.subflow_editor.as_ref().unwrap().1.subflow_editor.as_ref().unwrap().1;
+        assert_eq!(inner.selected, Some(0));
+        assert_eq!(inner.focus_node.as_deref(), Some("same/~"));
+        app.select_overlay_key("same~1~0").unwrap();
+        assert!(app.subflow_editor.is_none());
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.focus_node.as_deref(), Some("same/~"));
+        assert_eq!(app.graph.to_json(), original);
+        assert!(app.select_overlay_key("missing").is_err());
+    }
+
+    #[test]
+    fn region_windows_hide_during_runs_and_restore_without_changing_coordinates() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let captured = rendered.clone();
+        let events = Rc::new(RefCell::new(HashMap::<ViewportId, Vec<egui::Event>>::new()));
+        let viewport_events = events.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let visible = viewport.builder.visible.unwrap();
+            let position = viewport.builder.position.unwrap();
+            let size = viewport.builder.inner_size.unwrap();
+            let rect = if visible {
+                egui::Rect::from_min_size(position, size)
+            } else {
+                egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1.0, 1.0))
+            };
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                events: viewport_events.borrow_mut().remove(&viewport.ids.this).unwrap_or_default(),
+                ..Default::default()
+            };
+            input.viewports.insert(viewport.ids.this, egui::ViewportInfo {
+                parent: Some(viewport.ids.parent),
+                inner_rect: Some(rect),
+                outer_rect: Some(rect),
+                native_pixels_per_point: Some(if visible { 1.5 } else { 3.0 }),
+                ..Default::default()
+            });
+            let mut output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
+            let highlighted = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == NODE_SELECTED)
+            });
+            captured.borrow_mut().push((visible, output.shapes.len(), highlighted));
+            output.textures_delta.clear();
+        });
+        let mut app = app();
+        app.kind = 0;
+        app.add_node();
+        let mut nested = Graph::default();
+        nested.add_node(Node::new("nested_ocr", Kind::Ocr { single_line: false, last_hash: None })).unwrap();
+        app.graph.add_node(Node::new("subflow", Kind::Subflow { graph: Box::new(nested) })).unwrap();
+        app.selected = None;
+
+        let draw = |app: &mut App| {
+            rendered.borrow_mut().clear();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_overlays(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(rendered.borrow().len(), 2);
+        };
+        draw(&mut app);
+        let original = app.graph.to_json();
+        let scales = app.region_scales.clone();
+        assert_eq!(scales.len(), 2);
+        assert!(rendered.borrow().iter().all(|entry| !entry.2));
+        let click = |app: &mut App, key: &str, pos: Pos2| {
+            let id = ViewportId::from_hash_of(("overlay", key));
+            for pressed in [true, false] {
+                events.borrow_mut().insert(id, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                draw(app);
+            }
+            draw(app);
+        };
+        let root_key = region_key("", &app.graph.nodes[0].name);
+        click(&mut app, &root_key, Pos2::new(12.0, 10.0));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(rendered.borrow().iter().map(|entry| entry.2).collect::<Vec<_>>(), [true, false]);
+        click(&mut app, "subflow/nested_ocr", Pos2::new(40.0, 60.0));
+        assert_eq!(app.selected_overlay_key().as_deref(), Some("subflow/nested_ocr"));
+        assert_eq!(rendered.borrow().iter().map(|entry| entry.2).collect::<Vec<_>>(), [false, true]);
+        app.subflow_editor.as_mut().unwrap().1.selected = None;
+        draw(&mut app);
+        assert!(rendered.borrow().iter().all(|entry| !entry.2));
+        click(&mut app, &root_key, Pos2::new(297.0, 135.0));
+        assert!(app.subflow_editor.is_none());
+        assert_eq!(app.selected, Some(0));
+        app.selected = None;
+        app.pending_file_action = Some(FileAction::New);
+        click(&mut app, "subflow/nested_ocr", Pos2::new(12.0, 10.0));
+        assert_eq!(app.selected, None);
+        assert!(app.subflow_editor.is_none());
+        app.pending_file_action = None;
+        for stop in ["stop", "escape", "error"] {
+            app.set_running(true);
+            app.overlay_ready_at = Some(Instant::now() - OVERLAY_SETTLE_DELAY);
+            draw(&mut app);
+            assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| !visible && shapes == 0));
+            assert_eq!(app.graph.to_json(), original);
+            assert_eq!(app.region_scales, scales);
+            let ready = app.overlay_ready_at.unwrap();
+            assert!(ready > Instant::now());
+            draw(&mut app);
+            assert_eq!(app.overlay_ready_at, Some(ready));
+            match stop {
+                "escape" => {
+                    app.escape_pressed.store(true, Ordering::Relaxed);
+                    app.handle_escape(&ctx);
+                }
+                "error" => app.run_graph(),
+                _ => app.set_running(false),
+            }
+            assert!(!app.running);
+            draw(&mut app);
+            assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| visible && shapes > 0));
+            assert_eq!(app.graph.to_json(), original);
+            assert_eq!(app.region_scales, scales);
         }
     }
 
@@ -2644,6 +3337,33 @@ mod tests {
         captured: Vec<Region>,
         clicks: Vec<(i32, i32)>,
         fail: bool,
+    }
+
+    #[test]
+    fn workflow_screen_nodes_render_settings_and_stop_cancels_only_waits() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        for kind in 16..=20 {
+            app.kind = kind;
+            app.add_node();
+            app.selected = Some(app.graph.nodes.len() - 1);
+            app.node_settings_open = true;
+            frame(&ctx, &mut app, vec![]);
+            frame(&ctx, &mut app, vec![]);
+            assert!(app.node_settings_open);
+        }
+        let mut backend = RecordingBackend::default();
+        if let Kind::WaitForText { expected, .. } = &mut app.graph.nodes[0].kind {
+            *expected = "not yet visible".into();
+        }
+        app.graph.nodes[0].process(&[Value::Bool(true)], &mut backend).unwrap();
+        if let Kind::Once { armed, .. } = &mut app.graph.nodes[2].kind { *armed = true; }
+        app.graph.nodes[2].process(&[Value::Bool(true)], &mut backend).unwrap();
+        assert!(app.graph.has_pending_waits());
+        app.set_running(true);
+        app.set_running(false);
+        assert!(!app.graph.has_pending_waits());
+        assert!(matches!(app.graph.nodes[2].kind, Kind::Once { fired: true, .. }));
     }
 
     impl Backend for RecordingBackend {
@@ -3460,7 +4180,7 @@ mod tests {
         frame(&ctx, &mut app, vec![egui::Event::Text("BTC price".into())]);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.graph.nodes[0].title, "BTC price");
-        assert_eq!(node_label(&app.graph.nodes[0]), "BTC price");
+        assert_eq!(node_label(&app.graph.nodes[0]), "Model · BTC price");
         assert_eq!(app.graph.nodes[0].name, name);
     }
 

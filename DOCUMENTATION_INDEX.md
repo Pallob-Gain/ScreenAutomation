@@ -96,6 +96,12 @@ Read all 5 documentation files in order above
 - **Code change:** CHANGES_CHECKLIST.md → Issue 2 section
 - **Git diff:** `git diff src/node.rs` (lines 108-158)
 
+#### OCR Reliability and Node Identification
+- **Recognition improvements and limits:** [README.md](README.md) → OCR accuracy notes after the node settings table
+- **Model-backed regression test:** `cargo test --release --features gui --lib desktop::tests::small_price_ocr_preserves_decimals_and_text -- --ignored`
+- **Typed titles, icons, and grouped creation menu:** [README.md](README.md) → Using the application
+- **Creating groups and assigning nodes with the Group dropdown:** [README.md](README.md) → Editing, validation, and safe testing
+
 #### Node Deletion
 - **Status:** CHANGES_CHECKLIST.md → Issue 3 section
 - **How to use:** QUICK_REFERENCE.md → Node Creation section

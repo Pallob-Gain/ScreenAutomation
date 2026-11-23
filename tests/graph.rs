@@ -2,6 +2,31 @@ use screen_automation::backend::{Backend, Region};
 use screen_automation::graph::{EventRuntime, Graph, NodeEvent, RunMode};
 use screen_automation::node::{CompareOp, Crossing, Format, Kind, Node, Value};
 
+#[test]
+fn named_groups_preserve_empty_groups_and_discover_legacy_assignments() {
+    let mut graph = Graph::from_json(r#"{
+        "nodes": [{"name": "note", "type": "note", "text": "", "group": "Ticket",
+                   "color": [245, 230, 150], "opacity": 0.3}],
+        "edges": []
+    }"#).unwrap();
+    assert_eq!(graph.group_names(), ["Ticket"]);
+    assert!(!graph.to_json().contains("\"groups\""));
+    assert!(graph.add_group("  ").is_err());
+    assert!(graph.add_group(" ticket ").is_err());
+    assert_eq!(graph.add_group(" Review ").unwrap(), "Review");
+    assert!(graph.add_group("REVIEW").is_err());
+    let mut loaded = Graph::from_json(&graph.to_json()).unwrap();
+    assert_eq!(loaded.group_names(), ["Review", "Ticket"]);
+    assert_eq!(loaded.groups, ["Review"]);
+    assert_eq!(loaded.nodes[0].group, "Ticket");
+    assert!(loaded.validate().is_empty());
+    loaded.assign_group("note", "Review").unwrap();
+    loaded.assign_group("note", "").unwrap();
+    assert_eq!(Graph::from_json(&loaded.to_json()).unwrap().group_names(), ["Review", "Ticket"]);
+    assert!(loaded.assign_group("note", "Missing").is_err());
+    assert!(loaded.assign_group("missing-node", "Review").is_err());
+}
+
 #[derive(Default)]
 struct Fake {
     screen: String,

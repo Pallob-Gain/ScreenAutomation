@@ -1,8 +1,318 @@
-use screen_automation::backend::{Backend, Region};
+use screen_automation::backend::{Backend, KeyAction, Region};
 use screen_automation::event_sources::EventSource;
 use screen_automation::graph::{Edge, EventRuntime, Graph, NodeEvent};
-use screen_automation::node::{CompareOp, Format, Kind, Node, Value};
+use screen_automation::node::{CompareOp, Format, Kind, Node, TextMatch, Value};
 use screen_automation::preview::PreviewSession;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+struct Screen {
+    text: String,
+    script: VecDeque<String>,
+    now: Instant,
+    ocr_ms: u64,
+    captures: usize,
+    actions: Vec<String>,
+}
+
+impl Screen {
+    fn new(text: &str) -> Self {
+        Self { text: text.into(), script: VecDeque::new(), now: Instant::now(), ocr_ms: 0, captures: 0, actions: Vec::new() }
+    }
+
+    fn advance(&mut self, ms: u64) {
+        self.now += Duration::from_millis(ms);
+    }
+}
+
+impl Backend for Screen {
+    fn capture(&mut self, _: &Region) -> Result<Vec<u8>, String> {
+        self.captures += 1;
+        Ok(self.script.pop_front().unwrap_or_else(|| self.text.clone()).into_bytes())
+    }
+    fn ocr(&mut self, _: &Region, pixels: &[u8]) -> Result<String, String> {
+        self.advance(self.ocr_ms);
+        String::from_utf8(pixels.to_vec()).map_err(|error| error.to_string())
+    }
+    fn ocr_single_line(&mut self, region: &Region, pixels: &[u8]) -> Result<String, String> {
+        self.ocr(region, pixels)
+    }
+    fn click(&mut self, _: i32, _: i32, _: &str) -> Result<(), String> {
+        self.actions.push("click".into());
+        Ok(())
+    }
+    fn type_text(&mut self, text: &str) -> Result<(), String> {
+        self.actions.push(format!("type {text}"));
+        Ok(())
+    }
+    fn press_key(&mut self, key: KeyAction) -> Result<(), String> {
+        self.actions.push(format!("key {key:?}"));
+        Ok(())
+    }
+    fn now(&self) -> Instant { self.now }
+}
+
+fn wait_node(name: &str) -> Node {
+    Node::new(name, Kind::WaitForText {
+        expected: "Ready".into(), matching: TextMatch::Exact, case_sensitive: false,
+        single_line: false, timeout_ms: 1000, poll_ms: 100, pending: None,
+    })
+}
+
+fn guarded_wait_graph() -> Graph {
+    let mut graph = Graph::default();
+    for node in [
+        constant("source", "start"),
+        Node::new("once", Kind::Once { armed: true, fired: false }),
+        Node::new("open", Kind::Click { button: "left".into() }),
+        wait_node("wait"),
+        Node::new("submit", Kind::Click { button: "left".into() }),
+    ] { graph.add_node(node).unwrap(); }
+    for (source, target) in [("source", "once"), ("once", "open"), ("open", "wait"), ("wait", "submit")] {
+        graph.connect(source, target).unwrap();
+    }
+    graph
+}
+
+#[test]
+fn wait_polls_without_blocking_and_keeps_the_original_trigger() {
+    let mut node = wait_node("wait");
+    let mut screen = Screen::new("Loading");
+    assert_eq!(node.process(&[Value::Int(7)], &mut screen).unwrap(), None);
+    assert!(node.is_waiting());
+    screen.advance(99);
+    assert_eq!(node.process(&[Value::Int(99)], &mut screen).unwrap(), None);
+    assert_eq!(screen.captures, 1);
+    screen.advance(1);
+    screen.text = "  READY\n".into();
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(7)));
+    assert!(!node.is_waiting());
+    assert_eq!(screen.captures, 2);
+}
+
+#[test]
+fn wait_continues_after_upstream_stops_and_never_replays_previous_actions() {
+    let mut graph = guarded_wait_graph();
+    let mut screen = Screen::new("Loading");
+    graph.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions, ["click"]);
+    screen.advance(100);
+    screen.text = "Ready".into();
+    assert_eq!(graph.run_once(&mut screen).unwrap()["submit"], Some(Value::Bool(true)));
+    graph.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions, ["click", "click"]);
+    assert!(!graph.has_pending_waits());
+}
+
+#[test]
+fn event_wait_resumes_without_another_source_event_or_unrelated_actions() {
+    let mut graph = guarded_wait_graph();
+    graph.add_node(constant("other_source", "unrelated")).unwrap();
+    graph.add_node(Node::new("unrelated", Kind::Click { button: "left".into() })).unwrap();
+    graph.connect("other_source", "unrelated").unwrap();
+    let mut screen = Screen::new("Loading");
+    let mut runtime = EventRuntime::default();
+    graph.run_events(&[NodeEvent { source: "source".into(), value: Value::Text("go".into()) }],
+        &mut runtime, &mut screen).unwrap();
+    screen.advance(100);
+    screen.text = "Ready".into();
+    let result = graph.run_events(&[], &mut runtime, &mut screen).unwrap();
+    assert_eq!(result["submit"], Some(Value::Bool(true)));
+    assert!(!result.contains_key("unrelated"));
+    assert_eq!(screen.actions, ["click", "click"]);
+}
+
+#[test]
+fn timeout_and_stop_cancel_waits_without_rearming_once_gate() {
+    let mut graph = guarded_wait_graph();
+    let mut screen = Screen::new("Loading");
+    graph.run_once(&mut screen).unwrap();
+    screen.advance(1000);
+    let error = graph.run_once(&mut screen).unwrap_err();
+    assert!(error.contains("wait: timed out"), "{error}");
+    assert!(error.contains("order history"));
+    assert!(!graph.has_pending_waits());
+    graph.cancel_waits();
+    screen.text = "Ready".into();
+    graph.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions, ["click"]);
+
+    graph.reset_runtime();
+    screen.text = "Loading".into();
+    graph.run_once(&mut screen).unwrap();
+    assert!(graph.has_pending_waits());
+    graph.cancel_waits();
+    screen.text = "Ready".into();
+    graph.run_once(&mut screen).unwrap();
+    assert!(!graph.has_pending_waits());
+    assert_eq!(screen.actions, ["click", "click"]);
+}
+
+#[test]
+fn slow_ocr_cannot_submit_after_the_wait_deadline() {
+    for ocr_ms in [999, 1000, 1001] {
+        let mut graph = guarded_wait_graph();
+        let mut screen = Screen::new("Ready");
+        screen.ocr_ms = ocr_ms;
+        let result = graph.run_once(&mut screen);
+        if ocr_ms < 1000 {
+            result.unwrap();
+            assert_eq!(screen.actions, ["click", "click"]);
+        } else {
+            assert!(result.unwrap_err().contains("timed out"));
+            assert_eq!(screen.actions, ["click"]);
+            assert!(!graph.has_pending_waits());
+            screen.ocr_ms = 0;
+            graph.run_once(&mut screen).unwrap();
+            assert_eq!(screen.actions, ["click"]);
+        }
+    }
+}
+
+#[test]
+fn screen_assertions_fail_closed_and_validate_patterns() {
+    let mut graph = Graph::default();
+    graph.add_node(constant("source", "go")).unwrap();
+    graph.add_node(Node::new("check", Kind::AssertText {
+        expected: "^Buy 1 NVDA$".into(), matching: TextMatch::Regex, case_sensitive: true, single_line: false,
+    })).unwrap();
+    graph.add_node(Node::new("submit", Kind::Click { button: "left".into() })).unwrap();
+    graph.connect("source", "check").unwrap();
+    graph.connect("check", "submit").unwrap();
+    let mut screen = Screen::new("Sell 1 NVDA");
+    assert!(graph.run_once(&mut screen).unwrap_err().contains("screen assertion failed"));
+    assert!(screen.actions.is_empty());
+    screen.text = "Buy\n1  NVDA".into();
+    graph.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions, ["click"]);
+    if let Kind::AssertText { expected, .. } = &mut graph.nodes[1].kind { *expected = "[".into(); }
+    assert!(graph.validate().iter().any(|issue| issue.message.contains("regex")));
+}
+
+#[test]
+fn field_replacement_and_keypress_are_ordered_and_dry_run_never_sends_input() {
+    let mut graph = Graph::default();
+    graph.add_node(constant("source", "1")).unwrap();
+    graph.add_node(Node::new("field", Kind::SetField { text: String::new() })).unwrap();
+    graph.add_node(Node::new("tab", Kind::Keypress { key: KeyAction::Tab })).unwrap();
+    graph.connect("source", "field").unwrap();
+    graph.connect("field", "tab").unwrap();
+    let mut screen = Screen::new("");
+    let mut preview = PreviewSession::new(&graph).unwrap();
+    let mut actions = Vec::new();
+    while let Some(step) = preview.step(&mut screen).unwrap() { actions.extend(step.actions); }
+    assert_eq!(actions, ["click left at (250, 160)", "keypress Select all", "type 1", "keypress Tab"]);
+    assert!(screen.actions.is_empty());
+    graph.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions, ["click", "key SelectAll", "type 1", "key Tab"]);
+
+    let mut unsupported = Fake::default();
+    assert!(graph.run_once(&mut unsupported).unwrap_err().contains("not supported"));
+    assert_eq!(unsupported.typed, 0);
+}
+
+#[test]
+fn preview_pauses_at_wait_instead_of_skipping_a_screen_transition() {
+    let graph = guarded_wait_graph();
+    let mut preview = PreviewSession::new(&graph).unwrap();
+    let mut screen = Screen::new("Loading");
+    for _ in 0..4 { preview.step(&mut screen).unwrap().unwrap(); }
+    assert!(preview.is_waiting());
+    screen.advance(100);
+    screen.text = "Ready".into();
+    assert_eq!(preview.step(&mut screen).unwrap().unwrap().node, "wait");
+    assert_eq!(preview.step(&mut screen).unwrap().unwrap().node, "submit");
+    assert!(preview.is_finished());
+    assert!(screen.actions.is_empty());
+}
+
+#[test]
+fn waits_reject_invalid_timing_and_nested_use_and_latches_do_not_serialize() {
+    let mut graph = guarded_wait_graph();
+    let mut screen = Screen::new("Ready");
+    graph.run_once(&mut screen).unwrap();
+    assert!(!graph.to_json().contains("\"fired\""));
+    assert!(!graph.to_json().contains("\"pending\""));
+    let mut loaded = Graph::from_json(&graph.to_json()).unwrap();
+    loaded.run_once(&mut screen).unwrap();
+    assert_eq!(screen.actions.len(), 4);
+    if let Kind::WaitForText { poll_ms, .. } = &mut graph.nodes[3].kind { *poll_ms = 0; }
+    assert!(graph.validate().iter().any(|issue| issue.message.contains("poll interval")));
+    let mut outer = Graph::default();
+    graph.add_node(Node::new("out", Kind::SubflowOutput)).unwrap();
+    graph.connect("submit", "out").unwrap();
+    outer.add_node(Node::new("nested", Kind::Subflow { graph: Box::new(graph) })).unwrap();
+    assert!(outer.validate().iter().any(|issue| issue.message.contains("top-level")));
+}
+
+#[test]
+fn paper_trading_fixture_is_disarmed_and_runs_one_verified_order_when_configured() {
+    for (json, summary, final_action) in [
+        (include_str!("trading-buy.json"),
+            "Paper order #1. Buy 1 NVDA filled at $166.00 per share. Total cost: $166.00.", "click"),
+        (include_str!("trading-buy.calibrated.json"),
+            "Paper order #1. Buy 1 NVDA filled at $ 166.00 per share.", "key Enter"),
+    ] {
+        let mut graph = Graph::from_json(json).unwrap();
+        assert!(graph.validate().is_empty(), "{:?}", graph.validate());
+        let mut screen = Screen::new("166.00");
+        graph.run_once(&mut screen).unwrap();
+        assert!(screen.actions.is_empty());
+        assert!(matches!(graph.nodes.iter().find(|node| node.name == "one_order").unwrap().kind,
+            Kind::Once { armed: false, fired: false }));
+        graph.reset_runtime();
+        if let Kind::Once { armed, .. } = &mut graph.nodes.iter_mut().find(|node| node.name == "one_order").unwrap().kind {
+            *armed = true;
+        }
+        screen.script = [
+            "166.00", "PAPER TRADING", "0", "Review buy order", "1",
+            "Review buy order", "NVIDIA (NVDA)", "Buy", "1 shares", "Market", "$166.00",
+            "Order filled", summary, "1",
+        ].into_iter().map(String::from).collect();
+        let output = graph.run_once(&mut screen).unwrap();
+        assert!(output["position_updated"].is_some(), "{output:?}; actions: {:?}", screen.actions);
+        assert_eq!(screen.actions, ["click", "click", "key SelectAll", "type 1", "click", "click", final_action]);
+        assert!(screen.script.is_empty());
+        graph.run_once(&mut screen).unwrap();
+        assert_eq!(screen.actions.len(), 7);
+    }
+}
+
+#[test]
+fn paper_round_trip_fixture_verifies_both_sides_and_cannot_repeat() {
+    for sell_side in ["Sell", "Buy"] {
+        let mut graph = Graph::from_json(include_str!("trading-buy-sell.calibrated.json")).unwrap();
+        assert!(graph.validate().is_empty(), "{:?}", graph.validate());
+        let mut screen = Screen::new("166.00");
+        graph.run_once(&mut screen).unwrap();
+        assert!(screen.actions.is_empty());
+        graph.reset_runtime();
+        if let Kind::Once { armed, .. } = &mut graph.nodes.iter_mut().find(|node| node.name == "one_order").unwrap().kind {
+            *armed = true;
+        }
+        screen.script = [
+            "166.00", "PAPER TRADING", "0", "Review buy order", "1",
+            "Review buy order", "NVIDIA (NVDA)", "Buy", "1 shares", "Market", "$ 166.00",
+            "Order filled", "Paper order #1. Buy 1 NVDA filled at $ 166.00 per share.", "1",
+            "Review sell order", "1", "Review sell order", "NVIDIA (NVDA)", sell_side,
+            "1 shares", "Market", "$166.00", "Order filled",
+            "Paper order #2. Sell 1 NVDA filled at $ 166.00 per share.", "0",
+        ].into_iter().map(String::from).collect();
+        let result = graph.run_once(&mut screen);
+        let leg = ["click", "click", "key SelectAll", "type 1", "click", "click", "key Enter"];
+        if sell_side == "Sell" {
+            let output = result.unwrap();
+            assert!(output["position_updated"].is_some() && output["flat_position"].is_some(), "{output:?}");
+            assert_eq!(screen.actions, leg.repeat(2));
+            assert!(screen.script.is_empty());
+            graph.run_once(&mut screen).unwrap();
+            assert_eq!(screen.actions.len(), 14);
+        } else {
+            assert!(result.unwrap_err().contains("sell_check_side"));
+            assert_eq!(screen.actions, [leg.as_slice(), &leg[..5]].concat());
+        }
+    }
+}
 
 #[derive(Default)]
 struct Fake {

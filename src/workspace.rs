@@ -32,8 +32,10 @@ impl GraphHistory {
             }
             self.present = snapshot;
             self.redo.clear();
+            self.group = group;
+        } else if group != self.group {
+            self.group = None;
         }
-        self.group = group;
         changed
     }
 
@@ -164,10 +166,14 @@ mod tests {
     #[test]
     fn history_groups_gestures_and_discards_redo_after_new_edits() {
         let mut history = GraphHistory::new("initial".into());
+        history.record("initial".into(), Some(1));
+        history.record("initial".into(), Some(1));
         history.record("drag-start".into(), Some(1));
         history.record("drag-middle".into(), Some(1));
         history.record("drag-end".into(), Some(1));
         history.record("drag-end".into(), None);
+        history.record("drag-end".into(), Some(2));
+        history.record("drag-end".into(), Some(2));
         history.record("typed".into(), Some(2));
         assert_eq!(history.undo().as_deref(), Some("drag-end"));
         assert_eq!(history.undo().as_deref(), Some("initial"));

@@ -52,6 +52,8 @@ fn deserialize_refresh_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> 
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     #[serde(default)]
     pub settings: GraphSettings,
 }
@@ -118,6 +120,46 @@ fn input_slots(
 }
 
 impl Graph {
+    pub fn group_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.groups.iter()
+            .chain(self.nodes.iter().map(|node| &node.group))
+            .map(String::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    pub fn add_group(&mut self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Enter a group name.".into());
+        }
+        let key = name.to_lowercase();
+        if self.group_names().iter().any(|existing| existing.trim().to_lowercase() == key) {
+            return Err(format!("Group {name:?} already exists. Select it from the Group dropdown."));
+        }
+        self.groups.push(name.into());
+        Ok(name.into())
+    }
+
+    pub fn assign_group(&mut self, node: &str, group: &str) -> Result<(), String> {
+        let index = self.nodes.iter().position(|candidate| candidate.name == node)
+            .ok_or_else(|| format!("Cannot assign group: node {node:?} no longer exists."))?;
+        if !group.is_empty() && !self.group_names().contains(&group) {
+            return Err(format!("Group {group:?} does not exist."));
+        }
+        let previous = &self.nodes[index].group;
+        if previous != group {
+            if !previous.trim().is_empty() && !self.groups.contains(previous) {
+                self.groups.push(previous.clone());
+            }
+            self.nodes[index].group = group.into();
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Vec<GraphIssue> {
         let mut issues = Vec::new();
         self.validate_inner(0, false, &mut issues);
@@ -137,7 +179,8 @@ impl Graph {
             } else if !names.insert(&node.name) {
                 add("duplicate node name".into());
             }
-            if matches!(node.kind, Kind::Ocr { .. } | Kind::Keyboard { .. } | Kind::Click { .. })
+            if matches!(node.kind, Kind::Ocr { .. } | Kind::Keyboard { .. } | Kind::Click { .. }
+                | Kind::WaitForText { .. } | Kind::AssertText { .. } | Kind::SetField { .. })
                 && node.region.map_or(true, |r| r.width == 0 || r.height == 0) {
                 add("region is missing or has zero size".into());
             }
@@ -146,6 +189,18 @@ impl Graph {
             }
             let fixed = |parameter| node.parameter_port(parameter).is_none();
             match &node.kind {
+                Kind::WaitForText { expected, matching, timeout_ms, poll_ms, .. } => {
+                    if let Err(error) = matching.validate(expected) { add(error); }
+                    if !(1..=120_000).contains(timeout_ms) || *poll_ms == 0 || poll_ms > timeout_ms {
+                        add("wait requires timeout 1..120000 ms and poll interval 1..timeout ms".into());
+                    }
+                    if subflow {
+                        add("wait_for_text must be in the top-level graph, not a subflow".into());
+                    }
+                }
+                Kind::AssertText { expected, matching, .. } => {
+                    if let Err(error) = matching.validate(expected) { add(error); }
+                }
                 Kind::Threshold { lower, upper, trigger, .. } | Kind::Hysteresis { lower, upper, trigger, .. } => {
                     use InputParameter::{Lower, Upper};
                     if (fixed(Lower) && !lower.is_finite()) || (fixed(Upper) && !upper.is_finite())
@@ -373,12 +428,24 @@ impl Graph {
         }
     }
 
+    pub fn has_pending_waits(&self) -> bool {
+        self.nodes.iter().any(Node::is_waiting)
+    }
+
+    /// Stop continuations without rearming once gates.
+    pub fn cancel_waits(&mut self) {
+        for node in &mut self.nodes { node.cancel_wait(); }
+    }
+
     pub fn uses_subflow_input(&self) -> bool {
         self.nodes.iter().filter(|node| matches!(node.kind, Kind::SubflowInput))
             .any(|node| self.edges.iter().any(|edge| edge.source == node.name))
     }
 
     pub(crate) fn run_subflow(&mut self, input: Option<Value>, backend: &mut dyn Backend, depth: usize) -> Result<Option<Value>, String> {
+        if self.nodes.iter().any(|node| matches!(node.kind, Kind::WaitForText { .. })) {
+            return Err("wait_for_text must be in the top-level graph, not a subflow".into());
+        }
         if depth > MAX_SUBFLOW_DEPTH {
             return Err("maximum subflow depth exceeded".into());
         }
@@ -422,7 +489,7 @@ impl Graph {
             if !inputs.is_empty() {
                 self.nodes[i].process_slots(&slots, true, backend, depth).map_err(|e| format!("{name}: {e}"))?
             } else { None }
-        } else if !parents.is_empty() && inputs.is_empty() {
+        } else if !parents.is_empty() && inputs.is_empty() && !self.nodes[i].is_waiting() {
             None
         } else {
             self.nodes[i].process_with_depth(&inputs, backend, depth).map_err(|e| format!("{name}: {e}"))?
@@ -443,7 +510,7 @@ impl Graph {
         runtime: &mut EventRuntime,
         backend: &mut dyn Backend,
     ) -> Result<HashMap<String, Option<Value>>, String> {
-        if events.is_empty() {
+        if events.is_empty() && !self.has_pending_waits() {
             return Ok(HashMap::new());
         }
         let order = self.order()?;
@@ -462,7 +529,8 @@ impl Graph {
             }
             runtime.initialized = true;
         }
-        let mut affected: HashSet<String> = outputs.keys().cloned().collect();
+        let mut affected: HashSet<String> = outputs.keys().cloned()
+            .chain(self.nodes.iter().filter(|node| node.is_waiting()).map(|node| node.name.clone())).collect();
         for &index in &order {
             let name = &self.nodes[index].name;
             if self.edges.iter().any(|edge| edge.target == *name && affected.contains(&edge.source)) {
@@ -487,14 +555,16 @@ impl Graph {
                 continue;
             }
             let parents: Vec<&Edge> = self.edges.iter().filter(|edge| edge.target == name).collect();
-            let triggered = parents.iter().any(|edge| {
+            let triggered = self.nodes[index].is_waiting() || parents.iter().any(|edge| {
                 outputs.get(&edge.source).is_some_and(Option::is_some)
             });
             if !triggered && affected.contains(&name) {
                 continue;
             }
             if !triggered && matches!(self.nodes[index].kind,
-                Kind::Ocr { .. } | Kind::Keyboard { .. } | Kind::Click { .. } | Kind::Subflow { .. })
+                Kind::Ocr { .. } | Kind::Keyboard { .. } | Kind::Click { .. } | Kind::Subflow { .. }
+                    | Kind::WaitForText { .. } | Kind::AssertText { .. } | Kind::SetField { .. }
+                    | Kind::Keypress { .. } | Kind::Once { .. })
             {
                 continue;
             }
@@ -518,16 +588,17 @@ impl Graph {
                     }
                 })?;
                 if inputs.iter().any(Option::is_some) {
-                    self.nodes[index].process_slots(&inputs, main_is_fresh, backend, 0)?
+                    self.nodes[index].process_slots(&inputs, main_is_fresh, backend, 0)
+                        .map_err(|error| format!("{name}: {error}"))?
                 } else {
                     None
                 }
             } else {
                 let inputs: Vec<_> = parents.iter().filter_map(|edge| value_for(edge)).collect();
-                if !parents.is_empty() && inputs.is_empty() {
+                if !parents.is_empty() && inputs.is_empty() && !self.nodes[index].is_waiting() {
                     None
                 } else {
-                    self.nodes[index].process(&inputs, backend)?
+                    self.nodes[index].process(&inputs, backend).map_err(|error| format!("{name}: {error}"))?
                 }
             };
             if let Some(value) = &out {

@@ -1,4 +1,36 @@
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAction {
+    SelectAll,
+    Tab,
+    Enter,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    Backspace,
+}
+
+impl KeyAction {
+    pub const ALL: [Self; 7] = [
+        Self::SelectAll, Self::Tab, Self::Enter, Self::Escape,
+        Self::ArrowUp, Self::ArrowDown, Self::Backspace,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SelectAll => "Select all",
+            Self::Tab => "Tab",
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+            Self::ArrowUp => "Arrow up",
+            Self::ArrowDown => "Arrow down",
+            Self::Backspace => "Backspace",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Region {
@@ -32,4 +64,10 @@ pub trait Backend {
     }
     fn type_text(&mut self, text: &str) -> Result<(), String>;
     fn click(&mut self, x: i32, y: i32, button: &str) -> Result<(), String>;
+    fn press_key(&mut self, _: KeyAction) -> Result<(), String> {
+        Err("Key presses are not supported by this backend".into())
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }

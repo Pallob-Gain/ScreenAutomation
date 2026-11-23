@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paper Trading | ScreenAutomation</title>
+<style>
+  * { box-sizing: border-box; }
+  :root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; color: #edf2f0; background: #0b100f; --green: #70ebaa; --muted: #97a69f; --border: #293630; }
+  body { margin: 0; }
+  button, input, select { font: inherit; }
+  button, select { cursor: pointer; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #91bbff; outline-offset: 2px; }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--border); background: #101714; }
+  .header-inner, main { max-width: 1440px; margin: auto; }
+  .header-inner { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: -.3px; }
+  h1 span { color: var(--green); }
+  .badge { color: var(--green); background: #193024; border: 1px solid #345b44; padding: 6px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 1px; white-space: nowrap; }
+  nav { display: flex; gap: 24px; }
+  nav a { color: #bac8c0; text-decoration: none; font-size: 14px; }
+  nav a:hover { color: var(--green); }
+  main { padding: 24px 28px 40px; }
+  .notice { margin-bottom: 24px; color: #a4b5ac; font-size: 12px; line-height: 1.6; }
+  .notice strong { color: var(--green); }
+  .overview { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--border); padding-bottom: 22px; margin-bottom: 24px; }
+  .card { background: #111a16; border: 1px solid var(--border); border-radius: 12px; padding: 24px; min-width: 0; }
+  .overview .card { background: none; border: 0; border-radius: 0; padding: 0 24px; border-left: 1px solid var(--border); }
+  .overview .card:first-child { padding-left: 0; border-left: 0; }
+  .label { color: var(--muted); font-size: 13px; }
+  .metric { margin-top: 7px; font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 24px; align-items: start; }
+  .order-ticket { position: sticky; top: 20px; border-top: 2px solid #70ebaa; }
+  .left { display: grid; gap: 20px; min-width: 0; }
+  .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h2 { margin: 0; font-size: 17px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  th, td { padding: 14px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .number { text-align: right; font-variant-numeric: tabular-nums; }
+  .symbol { font-weight: 700; }
+  .company { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .up { color: var(--green); }
+  .down { color: #ff828c; }
+  .small-button { color: #c2d6ca; background: #1a2c22; border: 1px solid #375141; border-radius: 6px; padding: 7px 12px; }
+  .small-button:hover { background: #294536; }
+  .chart-card { overflow: hidden; }
+  .chart-title { font-size: 42px; font-weight: 600; letter-spacing: -1.5px; margin: 7px 0; font-variant-numeric: tabular-nums; }
+  #chartName { font-size: 20px; color: #ecf4ef; font-weight: 600; }
+  #chartChange { font-size: 14px; min-height: 22px; }
+  .chart-shell { position: relative; margin-top: 12px; padding-right: 64px; }
+  .chart { width: 100%; height: 300px; display: block; overflow: visible; touch-action: pan-y; }
+  .chart polyline { fill: none; stroke: var(--green); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .chart line { stroke: #26382e; stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .chart #crosshair { stroke: #9bb9a8; stroke-dasharray: 4 4; }
+  .price-axis { position: absolute; right: 0; top: 12px; bottom: 12px; display: flex; flex-direction: column; justify-content: space-between; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .time-axis { display: flex; justify-content: space-between; margin: 10px 64px 0 0; color: var(--muted); font-size: 11px; }
+  #chartReadout { min-height: 22px; color: #c0d3c7; font-size: 12px; margin-top: 10px; font-variant-numeric: tabular-nums; }
+  .chart-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; border-top: 1px solid var(--border); margin-top: 14px; padding-top: 16px; }
+  .ranges { display: flex; gap: 8px; }
+  .ranges button { padding: 7px 13px; border: 0; border-radius: 5px; background: transparent; color: #b4c6ba; font-size: 12px; font-weight: 700; }
+  .ranges button[aria-pressed="true"] { color: var(--green); background: #203b2a; }
+  button:disabled { cursor: not-allowed; opacity: .5; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 20px 0 0; padding-top: 20px; border-top: 1px solid var(--border); }
+  .stats dt { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .stats dd { margin: 0; font-size: 14px; font-weight: 600; }
+  .eyebrow { color: var(--green); font-size: 11px; letter-spacing: 1.5px; font-weight: 700; margin-bottom: 14px; }
+  .field { display: block; margin: 18px 0; }
+  .field label { display: block; margin-bottom: 8px; color: #b7cbbf; font-size: 13px; }
+  input, select { width: 100%; color: #eef4f0; background: #0d1510; border: 1px solid #3b5143; border-radius: 6px; padding: 12px; }
+  .estimate { display: flex; justify-content: space-between; gap: 10px; margin: 18px 0; font-size: 14px; }
+  [hidden] { display: none !important; }
+  .side-tabs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--border); margin: 20px 0; }
+  .side-tabs button { padding: 12px; border: 0; border-bottom: 3px solid transparent; background: none; color: var(--muted); font-weight: 700; }
+  .side-tabs #buy[aria-pressed="true"] { border-color: var(--green); color: var(--green); }
+  .side-tabs #sell[aria-pressed="true"] { border-color: #ff828c; color: #ff828c; }
+  .trade-button { width: 100%; border: 1px solid transparent; border-radius: 8px; padding: 14px; font-weight: 700; background: var(--green); color: #102518; }
+  .trade-button:hover { background: #99f5c2; }
+  .trade-button.sell-side { background: #f79b9f; color: #301415; }
+  .ticket-quote { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .ticket-quote strong { font-size: 21px; font-variant-numeric: tabular-nums; }
+  .order-help { font-size: 12px; color: var(--muted); line-height: 1.6; margin-top: 8px; }
+  .ticket-total { border-top: 1px solid var(--border); padding-top: 18px; font-size: 15px; }
+  .ticket-total strong { font-size: 20px; }
+  .ticket-account { margin-top: 20px; padding-top: 4px; border-top: 1px solid var(--border); }
+  dialog { color: #edf2f0; background: #131e18; border: 1px solid #42604c; border-radius: 14px; width: min(460px, calc(100% - 32px)); padding: 28px; max-height: 90vh; overflow-y: auto; }
+  dialog::backdrop { background: #000a; backdrop-filter: blur(3px); }
+  dialog h2 { font-size: 23px; margin-bottom: 8px; }
+  .review-details { margin: 22px 0; }
+  .review-details div { display: flex; justify-content: space-between; gap: 20px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .review-details dt { color: var(--muted); font-size: 13px; }
+  .review-details dd { margin: 0; text-align: right; font-size: 14px; font-weight: 600; }
+  .dialog-actions { display: flex; gap: 10px; margin-top: 22px; }
+  .dialog-actions .small-button { min-width: 90px; }
+  #reviewError { color: #ff9aa1; line-height: 1.5; font-size: 13px; }
+  #confirmationSummary { line-height: 1.7; color: #bdcfc3; }
+  .status-pill { display: inline-block; padding: 4px 8px; border-radius: 4px; background: #223b2a; color: #90e9af; font-size: 12px; }
+  .trade-button:disabled { opacity: .45; cursor: not-allowed; }
+  .quote-status { margin-top: 5px; line-height: 1.4; }
+  #orderMessage { min-height: 42px; margin: 14px 0 0; font-size: 13px; line-height: 1.5; color: #a9bad0; }
+  #orderMessage.error { color: #ff9aa1; }
+  #orderMessage.success { color: #66e0ac; }
+  .empty { color: #9aaac0; text-align: center; padding: 20px; }
+  .footer-note { margin: 15px 0 0; line-height: 1.5; }
+  @media (max-width: 800px) {
+    main { padding: 18px 16px 30px; }
+    header { padding: 16px; }
+    .layout { grid-template-columns: 1fr; }
+    .order-ticket { position: static; }
+    nav { display: none; }
+    .overview .card { padding: 0 10px; }
+    .overview .label { font-size: 11px; }
+    .metric { font-size: 22px; }
+    .card { padding: 18px; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .chart { height: 230px; }
+  }
+  @media (max-width: 440px) {
+    .overview { grid-template-columns: 1fr; gap: 14px; }
+    .overview .card { padding: 0; border: 0; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <h1><span>Screen</span>Trader</h1>
+    <nav aria-label="Main navigation"><a href="#market">Markets</a><a href="#holdings">Positions</a><a href="#activity">Activity</a></nav>
+    <span class="badge">PAPER TRADING</span>
+  </div>
+</header>
+<main>
+  <div class="notice"><strong>Practice account</strong> &nbsp; Real market data. Virtual money. Yahoo Finance data may be delayed; this is not an exchange real-time feed. SpaceX and Anthropic have no public quotes. Not affiliated with any brokerage.</div>
+
+  <section class="overview" aria-label="Account overview">
+    <div class="card"><div class="label">Portfolio value</div><div class="metric" id="portfolioValue">$100,000.00</div></div>
+    <div class="card"><div class="label">Buying power</div><div class="metric" id="cashBalance">$100,000.00</div></div>
+    <div class="card"><div class="label">Invested value</div><div class="metric" id="investedValue">$0.00</div></div>
+  </section>
+  <p class="muted" id="valuationStatus" role="status"></p>
+
+  <div class="layout">
+    <div class="left">
+      <section class="card chart-card" id="market">
+        <div class="eyebrow">MARKET OVERVIEW / US EQUITIES</div>
+        <div class="section-heading">
+          <div><h2 id="chartName">NVIDIA · NVDA</h2><div class="chart-title" id="chartPrice"></div><div id="chartChange"></div></div>
+          <span class="badge" id="marketBadge">USD / NASDAQ</span>
+        </div>
+        <div class="muted quote-status" id="quoteStatus" role="status"></div>
+        <div id="chartReadout">Loading market history...</div>
+        <div class="chart-shell">
+          <svg class="chart" id="chart" viewBox="0 0 800 300" preserveAspectRatio="none" role="img" aria-label="Historical stock prices">
+            <defs><linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#70ebaa" stop-opacity=".2"></stop><stop offset="100%" stop-color="#70ebaa" stop-opacity="0"></stop></linearGradient></defs>
+            <line x1="0" y1="12" x2="800" y2="12"></line>
+            <line x1="0" y1="150" x2="800" y2="150"></line>
+            <line x1="0" y1="288" x2="800" y2="288"></line>
+            <polygon id="chartArea" fill="url(#chartGradient)" points=""></polygon>
+            <polyline id="priceChart" points=""></polyline>
+            <line id="crosshair" x1="0" y1="0" x2="0" y2="300" visibility="hidden"></line>
+          </svg>
+          <div class="price-axis" aria-hidden="true"><span id="axisHigh"></span><span id="axisMid"></span><span id="axisLow"></span></div>
+        </div>
+        <div class="time-axis" aria-hidden="true"><span id="timeStart"></span><span id="timeMid"></span><span id="timeEnd"></span></div>
+        <div class="chart-toolbar">
+          <div class="ranges" role="group" aria-label="Chart time range">
+            <button type="button" data-range="1d" aria-pressed="true">1D</button>
+            <button type="button" data-range="5d" aria-pressed="false">5D</button>
+            <button type="button" data-range="1mo" aria-pressed="false">1M</button>
+          </div>
+          <span class="muted" id="chartInterval">1-minute bars / refresh 15s</span>
+        </div>
+        <dl class="stats">
+          <div><dt>Previous close</dt><dd id="statClose">—</dd></div>
+          <div><dt>Day high</dt><dd id="statHigh">—</dd></div>
+          <div><dt>Day low</dt><dd id="statLow">—</dd></div>
+          <div><dt>Volume</dt><dd id="statVolume">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div><h2>Your watchlist</h2><div class="muted">Real quotes / refresh every 15 seconds</div></div>
+          <button type="button" class="small-button" id="refreshPrices">Refresh quotes</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Instrument</th><th class="number">Price</th><th class="number">vs. previous close</th><th></th></tr></thead>
+            <tbody id="watchlist"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="holdings">
+        <div class="section-heading"><h2>Positions</h2><span class="muted">Current simulated holdings</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Instrument</th><th class="number">Shares</th><th class="number">Market price</th><th class="number">Market value</th></tr></thead>
+            <tbody id="positions"><tr><td class="empty" colspan="4">No positions yet. Place a simulated buy order to get started.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="activity">
+        <div class="section-heading"><h2>Order history</h2><span class="muted">This page session only</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Order</th><th>Side</th><th>Instrument</th><th>Type</th><th class="number">Shares</th><th class="number">Limit / fill</th><th>Status</th><th></th></tr></thead>
+            <tbody id="orderHistory"><tr><td class="empty" colspan="8">No paper orders yet.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="card order-ticket" aria-labelledby="orderTitle">
+      <div class="eyebrow">TRADE TICKET</div>
+      <h2 id="orderTitle">Trade NVIDIA</h2>
+      <div class="side-tabs" role="group" aria-label="Order side">
+        <button type="button" id="buy" aria-pressed="true">Buy</button>
+        <button type="button" id="sell" aria-pressed="false">Sell</button>
+      </div>
+      <div class="field">
+        <label for="instrument">Instrument</label>
+        <select id="instrument">
+          <option value="NVDA">NVIDIA (NVDA)</option>
+          <option value="AAPL">Apple (AAPL)</option>
+          <option value="SPACEX">SpaceX (private)</option>
+          <option value="ANTHROPIC">Anthropic (private)</option>
+        </select>
+      </div>
+      <div class="ticket-quote"><span class="muted">Last price</span><strong id="ticketPrice">—</strong></div>
+      <div class="field">
+        <label for="orderType">Order type</label>
+        <select id="orderType">
+          <option value="Market">Market order</option>
+          <option value="Limit">Limit order</option>
+        </select>
+        <p class="order-help" id="orderTypeHelp">Buy at the next available paper quote. The final price may differ from this estimate.</p>
+      </div>
+      <div class="field">
+        <label for="quantity">Quantity (shares)</label>
+        <input id="quantity" type="number" min="1" max="1000000" step="1" value="1" inputmode="numeric">
+      </div>
+      <div class="field" id="limitField" hidden>
+        <label for="limitPrice">Limit price ($)</label>
+        <input id="limitPrice" type="number" min="0.01" max="10000000" step="0.01" placeholder="0.00" inputmode="decimal">
+      </div>
+      <div class="estimate"><span class="muted">Time in force</span><strong id="timeInForce">Immediate</strong></div>
+      <div class="estimate ticket-total"><span id="estimateLabel">Estimated cost</span><strong id="estimatedTotal">$0.00</strong></div>
+      <button type="button" id="reviewOrder" class="trade-button">Review buy order</button>
+      <p id="orderMessage" role="status" aria-live="polite">Review your order before submitting. No real money is used.</p>
+      <div class="ticket-account">
+        <div class="estimate"><span class="muted">Buying power</span><strong id="ticketCash">$100,000.00</strong></div>
+        <div class="estimate"><span class="muted">Shares owned</span><strong id="sharesOwned">0</strong></div>
+        <div class="estimate"><span class="muted">Available to sell</span><strong id="availableShares">0</strong></div>
+      </div>
+      <p class="muted footer-note">Whole-share paper orders. Quotes may be delayed. Open orders reserve buying power or shares. All account data, including good-until-cancelled orders, resets when this page is refreshed.</p>
+    </section>
+  </div>
+</main>
+<dialog id="reviewDialog" aria-labelledby="reviewTitle" aria-describedby="reviewDisclaimer">
+  <div class="eyebrow">STEP 2 OF 2 / PAPER TRADE</div>
+  <h2 id="reviewTitle">Review order</h2>
+  <p class="muted">Check the details before you submit.</p>
+  <dl class="review-details">
+    <div><dt>Account</dt><dd>Individual · Paper</dd></div>
+    <div><dt>Instrument</dt><dd id="reviewInstrument"></dd></div>
+    <div><dt>Action</dt><dd id="reviewSide"></dd></div>
+    <div><dt>Order type</dt><dd id="reviewType"></dd></div>
+    <div><dt>Quantity</dt><dd id="reviewQuantity"></dd></div>
+    <div id="reviewLimitRow" hidden><dt>Limit price</dt><dd id="reviewLimit"></dd></div>
+    <div><dt>Time in force</dt><dd id="reviewDuration"></dd></div>
+    <div><dt id="reviewTotalLabel">Estimated cost</dt><dd id="reviewTotal"></dd></div>
+  </dl>
+  <p class="order-help" id="reviewDisclaimer"></p>
+  <p id="reviewError" role="alert"></p>
+  <div class="dialog-actions">
+    <button type="button" class="small-button" id="editOrder">Edit</button>
+    <button type="button" class="trade-button" id="confirmOrder">Submit buy order</button>
+  </div>
+</dialog>
+<dialog id="confirmationDialog" aria-labelledby="confirmationTitle">
+  <div class="eyebrow">PAPER ORDER</div>
+  <h2 id="confirmationTitle">Order received</h2>
+  <p id="confirmationSummary"></p>
+  <button type="button" class="trade-button" id="doneOrder">Done</button>
+</dialog>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const instruments = {
+    NVDA: { name: "NVIDIA", public: true },
+    AAPL: { name: "Apple", public: true },
+    SPACEX: { name: "SpaceX (private)", public: false },
+    ANTHROPIC: { name: "Anthropic (private)", public: false }
+  };
+  for (const asset of Object.values(instruments)) {
+    asset.price = null;
+    asset.previousClose = null;
+    asset.quoteTime = null;
+    asset.error = asset.public ? "Loading quote..." : "No public stock-market quote.";
+    asset.history = [];
+    asset.historyRange = null;
+    asset.high = null;
+    asset.low = null;
+    asset.volume = null;
+    asset.shares = 0;
+  }
+  $("watchlist").innerHTML = Object.entries(instruments).map(([symbol, asset]) =>
+    `<tr data-symbol="${symbol}"><td><span class="symbol">${symbol}</span><span class="company">${asset.name}</span></td>
+      <td class="number price"></td><td class="number change"></td>
+      <td class="number"><button type="button" class="small-button" data-symbol="${symbol}" aria-label="Trade ${asset.name}">Trade</button></td></tr>`
+  ).join("");
+  let cash = 10000000;
+  let refreshing = false;
+  let chartRange = "1d";
+  let chartPoints = [];
+  let orderSide = "Buy";
+  let reviewOrder = null;
+  let nextOrderId = 1;
+  const orders = [];
+  const money = (cents) => (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
+  const selected = () => instruments[$("instrument").value];
+  const rangeLabels = { "1d": "1-minute bars", "5d": "5-minute bars", "1mo": "30-minute bars" };
+  const chartTime = (time, dateOnly = false) => new Date(time * 1000).toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    ...(dateOnly ? { month: "short", day: "numeric" } : { hour: "numeric", minute: "2-digit" })
+  });
+
+  function quantity() {
+    const value = Number($("quantity").value);
+    return Number.isSafeInteger(value) && value >= 1 && value <= 1000000 ? value : null;
+  }
+
+  function limitPrice() {
+    const value = Number($("limitPrice").value);
+    const cents = Math.round(value * 100);
+    return value > 0 && value <= 10000000 && Math.abs(value * 100 - cents) < 0.00001 ? cents : null;
+  }
+
+  function buyingPower() {
+    return cash - orders.filter((order) => order.status === "Open" && order.side === "Buy")
+      .reduce((total, order) => total + order.quantity * order.limit, 0);
+  }
+
+  function availableShares(symbol) {
+    return instruments[symbol].shares - orders.filter((order) =>
+      order.status === "Open" && order.side === "Sell" && order.symbol === symbol
+    ).reduce((total, order) => total + order.quantity, 0);
+  }
+
+  function validateOrder(order) {
+    const asset = instruments[order.symbol];
+    if (asset.price === null || asset.error) return "A current provider quote is required to place a paper order.";
+    if (order.quantity === null) return "Enter a whole number of shares between 1 and 1,000,000.";
+    if (order.type === "Limit" && order.limit === null) return "Enter a limit price from $0.01 to $10,000,000.00, in whole cents.";
+    const total = order.quantity * (order.type === "Limit" ? order.limit : asset.price);
+    if (order.side === "Buy" && total > buyingPower()) return "Not enough buying power. Open buy orders reserve cash.";
+    if (order.side === "Sell" && order.quantity > availableShares(order.symbol)) return "Not enough available shares. Open sell orders reserve shares.";
+    return "";
+  }
+
+  function renderChart(asset) {
+    $("chartName").textContent = `${asset.name} · ${$("instrument").value}`;
+    $("orderTitle").textContent = `Trade ${asset.name}`;
+    $("marketBadge").textContent = asset.public ? "USD / NASDAQ" : "PRIVATE COMPANY";
+    $("chart").setAttribute("aria-label", `${asset.name} historical prices, ${chartRange}. Times in New York.`);
+    $("chartPrice").textContent = asset.price === null ? "Unavailable" : money(asset.price);
+    const time = asset.quoteTime === null ? "" : ` Market quote time: ${new Date(asset.quoteTime * 1000).toLocaleString()} (may be delayed).`;
+    $("quoteStatus").textContent = (asset.error || "") + time;
+    if (asset.price !== null && asset.previousClose !== null) {
+      const change = asset.price - asset.previousClose;
+      $("chartChange").textContent = `${change >= 0 ? "+" : "-"}${money(Math.abs(change))} (${(change / asset.previousClose * 100).toFixed(2)}%) vs. previous close`;
+      $("chartChange").className = change >= 0 ? "up" : "down";
+    } else {
+      $("chartChange").textContent = asset.public ? "Waiting for market data" : "Private company / not publicly traded";
+      $("chartChange").className = "muted";
+    }
+    for (const [id, value] of [["statClose", asset.previousClose], ["statHigh", asset.high], ["statLow", asset.low]]) {
+      $(id).textContent = value === null ? "—" : money(value);
+    }
+    $("statVolume").textContent = asset.volume === null ? "—" : asset.volume.toLocaleString("en-US");
+    $("chartInterval").textContent = `${rangeLabels[chartRange]} / refresh 15s`;
+    $("crosshair").setAttribute("visibility", "hidden");
+    chartPoints = [];
+    if (!asset.history.length || asset.historyRange !== chartRange) {
+      $("priceChart").setAttribute("points", "");
+      $("chartArea").setAttribute("points", "");
+      for (const id of ["axisHigh", "axisMid", "axisLow", "timeStart", "timeMid", "timeEnd"]) $(id).textContent = "";
+      $("chartReadout").textContent = !asset.public ? "No public price history available." : asset.error || "Loading price history...";
+      return;
+    }
+    const min = Math.min(...asset.history.map((point) => point.price));
+    const max = Math.max(...asset.history.map((point) => point.price));
+    const padding = Math.max((max - min) * .08, 1);
+    const low = min - padding;
+    const high = max + padding;
+    const start = asset.history[0].time;
+    const end = asset.history[asset.history.length - 1].time;
+    // Equal bar spacing excludes overnight and weekend gaps, as on a trading chart.
+    chartPoints = asset.history.map((point, index) => ({
+      ...point,
+      x: asset.history.length === 1 ? 400 : index * 800 / (asset.history.length - 1),
+      y: 288 - (point.price - low) * 276 / (high - low)
+    }));
+    const points = chartPoints.map((point) => `${point.x},${point.y}`).join(" ");
+    $("priceChart").setAttribute("points", points);
+    $("chartArea").setAttribute("points", `${chartPoints[0].x},300 ${points} ${chartPoints[chartPoints.length - 1].x},300`);
+    $("axisHigh").textContent = money(high);
+    $("axisMid").textContent = money((high + low) / 2);
+    $("axisLow").textContent = money(low);
+    $("timeStart").textContent = chartTime(start, chartRange !== "1d");
+    $("timeMid").textContent = chartTime(asset.history[Math.floor(asset.history.length / 2)].time, chartRange !== "1d");
+    $("timeEnd").textContent = chartTime(end, chartRange !== "1d");
+    $("chartReadout").textContent = `${asset.history.length} market data points / New York time / Hover to inspect`;
+  }
+
+  function render() {
+    for (const [symbol, asset] of Object.entries(instruments)) {
+      const row = $("watchlist").querySelector(`tr[data-symbol="${symbol}"]`);
+      row.querySelector(".price").textContent = asset.price === null ? "Unavailable" : money(asset.price) + (asset.error ? " (stale)" : "");
+      row.querySelector(".price").title = asset.error || `Quote time: ${new Date(asset.quoteTime * 1000).toLocaleString()}`;
+      const changeEl = row.querySelector(".change");
+      if (asset.price !== null && asset.previousClose !== null) {
+        const change = (asset.price - asset.previousClose) / asset.previousClose * 100;
+        changeEl.textContent = `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`;
+        changeEl.className = `number change ${change >= 0 ? "up" : "down"}`;
+      } else {
+        changeEl.textContent = "—";
+        changeEl.className = "number change";
+      }
+    }
+    const held = Object.entries(instruments).filter(([, asset]) => asset.shares > 0);
+    $("positions").innerHTML = held.length ? held.map(([symbol, asset]) =>
+      `<tr><td><span class="symbol">${symbol}</span><span class="company">${asset.name}</span></td><td class="number">${asset.shares}</td><td class="number">${money(asset.price)}${asset.error ? " (stale)" : ""}</td><td class="number">${money(asset.price * asset.shares)}</td></tr>`
+    ).join("") : '<tr><td class="empty" colspan="4">No positions yet. Place a simulated buy order to get started.</td></tr>';
+    const invested = held.reduce((total, [, asset]) => total + asset.price * asset.shares, 0);
+    $("valuationStatus").textContent = held.some(([, asset]) => asset.error) ? "Portfolio and invested values include last known prices for stale quotes." : "";
+    $("cashBalance").textContent = money(buyingPower());
+    $("ticketCash").textContent = money(buyingPower());
+    $("investedValue").textContent = money(invested);
+    $("portfolioValue").textContent = money(cash + invested);
+    $("sharesOwned").textContent = selected().shares;
+    $("availableShares").textContent = availableShares($("instrument").value);
+    $("ticketPrice").textContent = selected().price === null ? "—" : money(selected().price);
+    const count = quantity();
+    const canTrade = selected().price !== null && !selected().error;
+    const isLimit = $("orderType").value === "Limit";
+    const price = isLimit ? limitPrice() : selected().price;
+    $("estimatedTotal").textContent = count === null || !canTrade || price === null ? "—" : money(count * price);
+    $("limitField").hidden = !isLimit;
+    $("timeInForce").textContent = isLimit ? "Good until cancelled" : "Immediate";
+    $("estimateLabel").textContent = orderSide === "Buy" ? (isLimit ? "Maximum cost" : "Estimated cost") : (isLimit ? "Minimum proceeds" : "Estimated proceeds");
+    $("orderTypeHelp").textContent = isLimit
+      ? `${orderSide === "Buy" ? "Buy at your limit price or lower" : "Sell at your limit price or higher"}. Unfilled orders remain open until cancelled or the page is refreshed.`
+      : `${orderSide} at the available paper quote when submitted. The final price may differ from this estimate.`;
+    $("reviewOrder").textContent = `Review ${orderSide.toLowerCase()} order`;
+    $("reviewOrder").classList.toggle("sell-side", orderSide === "Sell");
+    $("reviewOrder").disabled = !canTrade;
+    $("buy").setAttribute("aria-pressed", String(orderSide === "Buy"));
+    $("sell").setAttribute("aria-pressed", String(orderSide === "Sell"));
+    renderChart(selected());
+    if (reviewOrder) renderReview();
+  }
+
+  function renderOrders() {
+    $("orderHistory").innerHTML = orders.map((order) =>
+      `<tr><td>#${order.id}<span class="company">${order.time}</span></td><td class="${order.side === "Buy" ? "up" : "down"}">${order.side}</td><td>${order.symbol}</td><td>${order.type}</td><td class="number">${order.quantity}</td><td class="number">${money(order.price ?? order.limit)}<span class="company">${order.price === null ? "Limit" : "Fill"}</span></td><td><span class="status-pill">${order.status}</span></td><td>${order.status === "Open" ? `<button type="button" class="small-button" data-cancel="${order.id}" aria-label="Cancel order ${order.id}">Cancel</button>` : ""}</td></tr>`
+    ).join("");
+  }
+
+  function message(text, type) {
+    $("orderMessage").textContent = text;
+    $("orderMessage").className = type;
+  }
+
+  function fillOrder(order, price) {
+    const asset = instruments[order.symbol];
+    const total = order.quantity * price;
+    if (order.side === "Buy") {
+      cash -= total;
+      asset.shares += order.quantity;
+    } else {
+      cash += total;
+      asset.shares -= order.quantity;
+    }
+    order.status = "Filled";
+    order.price = price;
+  }
+
+  function limitMatches(order, price) {
+    return order.side === "Buy" ? price <= order.limit : price >= order.limit;
+  }
+
+  function renderConfirmation(order) {
+    const summary = order.status === "Filled"
+      ? `${order.side} ${order.quantity} ${order.symbol} filled at ${money(order.price)} per share. Total ${order.side === "Buy" ? "cost" : "proceeds"}: ${money(order.price * order.quantity)}.`
+      : `${order.side} ${order.quantity} ${order.symbol} at a limit of ${money(order.limit)}. Your order is open. ${order.side === "Buy" ? `${money(order.limit * order.quantity)} of buying power is reserved.` : `${order.quantity} shares are reserved.`} You can cancel it in Order history.`;
+    $("confirmationDialog").dataset.orderId = order.id;
+    $("confirmationTitle").textContent = order.status === "Filled" ? "Order filled" : "Limit order placed";
+    $("confirmationSummary").textContent = `Paper order #${order.id}. ${summary}`;
+  }
+
+  function processOpenOrders(symbol) {
+    const asset = instruments[symbol];
+    let filled = false;
+    for (const order of [...orders].reverse()) {
+      if (order.symbol === symbol && order.status === "Open" && asset.quoteTime > order.submittedQuoteTime && limitMatches(order, asset.price)) {
+        fillOrder(order, asset.price);
+        if ($("confirmationDialog").open && Number($("confirmationDialog").dataset.orderId) === order.id) renderConfirmation(order);
+        message(`Paper order #${order.id} filled: ${order.side.toLowerCase()} ${order.quantity} ${symbol} at ${money(asset.price)}.`, "success");
+        filled = true;
+      }
+    }
+    if (filled) renderOrders();
+  }
+
+  function renderReview() {
+    const order = reviewOrder;
+    $("reviewTitle").textContent = `Review ${order.side.toLowerCase()} order`;
+    $("reviewInstrument").textContent = `${instruments[order.symbol].name} (${order.symbol})`;
+    $("reviewSide").textContent = order.side;
+    $("reviewType").textContent = order.type;
+    $("reviewQuantity").textContent = `${order.quantity} shares`;
+    $("reviewLimitRow").hidden = order.type !== "Limit";
+    $("reviewLimit").textContent = order.limit === null ? "—" : money(order.limit);
+    $("reviewDuration").textContent = order.type === "Limit" ? "Good until cancelled" : "Immediate";
+    $("reviewTotalLabel").textContent = order.side === "Buy" ? (order.type === "Limit" ? "Maximum cost" : "Estimated cost") : (order.type === "Limit" ? "Minimum proceeds" : "Estimated proceeds");
+    $("reviewTotal").textContent = money(order.quantity * (order.type === "Limit" ? order.limit : instruments[order.symbol].price));
+    $("reviewDisclaimer").textContent = order.type === "Limit"
+      ? "Paper order. Fills when a subsequently received quote reaches your limit or better, or immediately if the current quote qualifies. No guaranteed fill or real exchange execution. Open orders expire on page refresh."
+      : "Paper order. Your estimated total updates with incoming quotes. Submission uses the latest available quote, which may be delayed. No real money is used.";
+    const error = validateOrder(order);
+    $("reviewError").textContent = error;
+    $("confirmOrder").disabled = Boolean(error);
+    $("confirmOrder").textContent = `Submit ${order.side.toLowerCase()} order`;
+    $("confirmOrder").classList.toggle("sell-side", order.side === "Sell");
+  }
+
+  $("reviewOrder").addEventListener("click", () => {
+    const order = {
+      symbol: $("instrument").value, side: orderSide, type: $("orderType").value,
+      quantity: quantity(), limit: $("orderType").value === "Limit" ? limitPrice() : null
+    };
+    const error = validateOrder(order);
+    if (error) {
+      message(error, "error");
+      return;
+    }
+    reviewOrder = order;
+    renderReview();
+    $("reviewDialog").showModal();
+  });
+  $("editOrder").addEventListener("click", () => $("reviewDialog").close());
+  $("reviewDialog").addEventListener("close", () => { reviewOrder = null; });
+  $("confirmOrder").addEventListener("click", () => {
+    if (!reviewOrder) return;
+    const error = validateOrder(reviewOrder);
+    if (error) {
+      $("reviewError").textContent = error;
+      $("confirmOrder").disabled = true;
+      return;
+    }
+    $("confirmOrder").disabled = true;
+    const order = {
+      ...reviewOrder, id: nextOrderId++, status: "Open", price: null,
+      time: new Date().toLocaleTimeString("en-US"),
+      submittedQuoteTime: instruments[reviewOrder.symbol].quoteTime
+    };
+    reviewOrder = null;
+    orders.unshift(order);
+    const price = instruments[order.symbol].price;
+    if (order.type === "Market" || limitMatches(order, price)) fillOrder(order, price);
+    $("reviewDialog").close();
+    renderOrders();
+    render();
+    renderConfirmation(order);
+    message(`Paper order #${order.id}: ${order.status.toLowerCase()}.`, "success");
+    $("confirmationDialog").showModal();
+  });
+  $("doneOrder").addEventListener("click", () => $("confirmationDialog").close());
+  $("orderHistory").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-cancel]");
+    if (!button) return;
+    const order = orders.find((item) => item.id === Number(button.dataset.cancel));
+    if (!order || order.status !== "Open") {
+      message("This order is no longer open and cannot be cancelled.", "error");
+      return;
+    }
+    order.status = "Cancelled";
+    message(`Paper order #${order.id} cancelled. Reserved buying power or shares released.`, "success");
+    renderOrders();
+    render();
+  });
+
+  function instrumentChanged() {
+    $("limitPrice").value = "";
+    message("Review your order before submitting. No real money is used.", "");
+    render();
+  }
+  $("watchlist").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-symbol]");
+    if (!button) return;
+    $("instrument").value = button.dataset.symbol;
+    instrumentChanged();
+  });
+  $("instrument").addEventListener("change", instrumentChanged);
+  $("orderType").addEventListener("change", () => {
+    if ($("orderType").value === "Limit" && $("limitPrice").value === "" && selected().price !== null) {
+      $("limitPrice").value = (selected().price / 100).toFixed(2);
+    }
+    render();
+  });
+  $("quantity").addEventListener("input", render);
+  $("limitPrice").addEventListener("input", render);
+  for (const side of ["Buy", "Sell"]) {
+    $(side.toLowerCase()).addEventListener("click", () => {
+      orderSide = side;
+      message("Review your order before submitting. No real money is used.", "");
+      render();
+    });
+  }
+  $("chart").addEventListener("pointermove", (event) => {
+    if (!chartPoints.length) return;
+    const bounds = $("chart").getBoundingClientRect();
+    const x = Math.max(0, Math.min(800, (event.clientX - bounds.left) / bounds.width * 800));
+    const nearest = chartPoints.reduce((best, point) => Math.abs(point.x - x) < Math.abs(best.x - x) ? point : best);
+    $("crosshair").setAttribute("x1", nearest.x);
+    $("crosshair").setAttribute("x2", nearest.x);
+    $("crosshair").setAttribute("visibility", "visible");
+    $("chartReadout").textContent = `${chartTime(nearest.time, true)} ${chartTime(nearest.time)} ET / ${money(nearest.price)}`;
+  });
+  $("chart").addEventListener("pointerleave", () => renderChart(selected()));
+  document.querySelectorAll("[data-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      chartRange = button.dataset.range;
+      document.querySelectorAll("[data-range]").forEach((item) => item.setAttribute("aria-pressed", String(item === button)));
+      render();
+      refreshQuotes();
+    });
+  });
+  async function refreshQuotes() {
+    if (refreshing) return;
+    refreshing = true;
+    $("refreshPrices").disabled = true;
+    document.querySelectorAll("[data-range]").forEach((button) => { button.disabled = true; });
+    await Promise.all(Object.entries(instruments).filter(([, asset]) => asset.public).map(async ([symbol, asset]) => {
+      try {
+        if (location.protocol === "file:") throw new Error("Start trading-server.js and open the local server URL.");
+        const response = await fetch(`/api/quote?symbol=${symbol}&range=${chartRange}`, { cache: "no-store", signal: AbortSignal.timeout(15000) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        if (data.symbol !== symbol || data.range !== chartRange || !Number.isFinite(data.price) || data.price <= 0 ||
+            !Number.isFinite(data.time) || data.time <= 0 || !Array.isArray(data.history) || !data.history.length ||
+            !data.history.every((point) => Number.isFinite(point.time) && point.time > 0 && Number.isFinite(point.price) && point.price > 0)) {
+          throw new Error("Invalid quote data.");
+        }
+        asset.price = Math.round(data.price * 100);
+        asset.previousClose = Number.isFinite(data.previousClose) && data.previousClose > 0 ? Math.round(data.previousClose * 100) : null;
+        asset.quoteTime = data.time;
+        asset.error = "";
+        asset.history = data.history.map((point) => ({ time: point.time, price: Math.round(point.price * 100) }));
+        asset.historyRange = data.range;
+        asset.high = Number.isFinite(data.high) && data.high > 0 ? Math.round(data.high * 100) : null;
+        asset.low = Number.isFinite(data.low) && data.low > 0 ? Math.round(data.low * 100) : null;
+        asset.volume = Number.isFinite(data.volume) && data.volume > 0 ? data.volume : null;
+        processOpenOrders(symbol);
+      } catch (error) {
+        asset.error = `Quote unavailable: ${error.message}${asset.price === null ? "" : " Last known price shown; trading disabled."}`;
+      }
+      render();
+    }));
+    refreshing = false;
+    $("refreshPrices").disabled = false;
+    document.querySelectorAll("[data-range]").forEach((button) => { button.disabled = false; });
+  }
+  $("refreshPrices").addEventListener("click", refreshQuotes);
+  setInterval(refreshQuotes, 15000);
+  render();
+  refreshQuotes();
+})();
+</script>
+</body>
+</html>
