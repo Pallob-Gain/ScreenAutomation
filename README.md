@@ -309,6 +309,31 @@ A repeat desktop test completed **five one-share buy/sell round trips**, produci
 
 A subsequent rapid-repeat desktop test used a temporary, finite ten-round chain with 100 ms workflow refresh and wait polling, retaining the calibrated assertions and confirmations. It was stopped after **eight completed rounds**, not the planned ten. Order history verified exactly **16 additional filled one-share NVDA Market orders**, alternating Buy/Sell (#11 through #26), with **122 seconds between the first and last new fills**. Final holdings were zero and buying power remained **$100,000.01**; no account reset was used. This is measured screen/OCR throughput, not high-frequency trading or a completed ten-round certification. The temporary armed graph was removed; the user's subsequently reopened buy workflow was left stopped and saved disarmed.
 
+#### Continuous historical breakout paper workflow
+
+[`tests/trading-breakout.json`](tests/trading-breakout.json) is a **disarmed**, repeating screen workflow for NVDA. It uses a visible chart-study panel, like a trading platform indicator; the panel never submits orders. Order entry, review assertions, and fill verification remain in the screen workflow.
+
+1. Restart `node tests\web\trading-server.js` after updating the server. Open `http://127.0.0.1:8765/?breakout=1` in a **new tab** if you want to preserve an existing paper account. Refreshing a tab resets its account.
+2. Select **NVDA**, **Market**, and **1D** (one-minute candles), with 0-10 owned NVDA shares and no open orders. The study uses the highest high / lowest low of the **last 20 consecutive completed one-minute candles**, excluding the current candle and the appended last-price quote.
+3. **Buy start:** price strictly above resistance + 0.1%. **Buy stop:** price strictly below resistance. **Sell start:** price strictly below support - 0.1%. **Sell stop:** price strictly above support. Equality does not start or stop a phase. Levels stay frozen during an active phase and are recalculated while idle. Invalid data clears the phase.
+4. Check all regions before arming. Ticket and dialog regions reuse the calibrated layout above. The two new indicator crops are `signal` and the `indicator_armed` guards, positioned from measured desktop bounds at the layout above (125% Windows scaling, 67% Edge zoom); verify them on your display. The panel is fixed in the bottom-left gutter and does not move the existing ticket/dialog controls.
+5. Enable **guarded paper signals** in the panel, then set the workflow's `workflow_armed` Boolean Constant from `false` to `true` only when ready. Both must be armed. The workflow starts with `false`; merely opening the indicator never places orders.
+6. While a phase is active, submit **one share per order**, at most **10 held**, with **no short selling**. New signals are suppressed while either dialog is open and for a full second after confirmation closes. The changing position in each command allows the next order even if the price is unchanged. The page also checks quantity, symbol, Market type, phase, holdings, open orders, and cooldown again when Submit is clicked.
+7. Stop with **Esc**; disarm the panel and workflow before editing/repositioning. Once guarded signals have been enabled in a tab, disarming blocks new paper orders there until re-enabled or the tab is reloaded. If any review/fill check fails, inspect Order history before retrying: a failure after Submit does not undo a fill.
+
+Quotes older than **90 seconds**, insufficient/gapped history, a non-one-minute chart, or provider failures produce **WAIT**, never guessed prices or orders. Yahoo data may be delayed: closed markets and delayed feeds can legitimately leave this workflow waiting. This is a paper automation test, **not a recommended trading strategy or a live-trading certification**.
+
+Offline validation exercises ten buys followed by ten sells using simulated price moves, checks the ten/zero holding limits, strict four-threshold transitions, frozen levels, 999 ms versus 1,000 ms cooldown, busy-order suppression, and pre-submission phase changes. These tests do not send desktop input or place orders. Run:
+
+```powershell
+node --test tests\web\trading-server.test.js
+cargo test --test workflow_tools
+```
+
+An additional offline local-model OCR check recognized all 46 synthetic indicator crops exactly: every valid buy/sell position, WAIT, and both armed markers, with two text-rendering modes at the measured scale. This is not a desktop execution test; actual review/confirmation OCR still has the reliability limitations noted above.
+
+Regenerate the fixture after deliberately changing its template with `node tests\generate-breakout-workflow.js`.
+
 ## Project layout
 
 ```text
@@ -327,6 +352,8 @@ tests/
     index.html Manual test page (price feed, click counters, thresholds)
     trading.html Paper-trading test page
     trading-server.js Local quote proxy for the paper-trading page
+    breakout-study.js Historical breakout indicator and guarded paper signals
+  trading-breakout.json Disarmed repeating NVDA paper screen workflow
 ```
 
 ## Current scope

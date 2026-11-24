@@ -31,6 +31,13 @@ function normalizeChart(data, symbol) {
     else history.push(latest);
   }
   const positive = (value) => Number.isFinite(value) && value > 0 ? value : null;
+  const quoteBars = result.indicators.quote[0];
+  const bars = result.timestamp.flatMap((time, index) => {
+    const high = quoteBars.high?.[index], low = quoteBars.low?.[index], close = closes[index];
+    return Number.isSafeInteger(time) && time > 0 && time % 60 === 0 &&
+      [high, low, close].every((price) => Number.isFinite(price) && price > 0) &&
+      low <= close && close <= high ? [{ time, high, low }] : [];
+  }).sort((a, b) => a.time - b.time);
   return {
     symbol,
     price: meta.regularMarketPrice,
@@ -39,7 +46,8 @@ function normalizeChart(data, symbol) {
     high: positive(meta.regularMarketDayHigh),
     low: positive(meta.regularMarketDayLow),
     volume: positive(meta.regularMarketVolume),
-    history
+    history,
+    bars
   };
 }
 
@@ -85,13 +93,14 @@ const server = http.createServer((req, res) => {
     return;
   }
   const url = new URL(req.url, `http://127.0.0.1:${port}`);
-  if (url.pathname === "/" || url.pathname === "/trading.html") {
-    fs.readFile(page, (error, content) => {
+  if (url.pathname === "/" || url.pathname === "/trading.html" || url.pathname === "/breakout-study.js") {
+    const script = url.pathname === "/breakout-study.js";
+    fs.readFile(script ? path.join(__dirname, "breakout-study.js") : page, (error, content) => {
       if (error) {
-        sendJson(res, 500, { error: `Could not read trading page: ${error.message}` });
+        sendJson(res, 500, { error: `Could not read ${script ? "indicator module" : "trading page"}: ${error.message}` });
         return;
       }
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.writeHead(200, { "Content-Type": script ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8", "Cache-Control": "no-store" });
       res.end(content);
     });
   } else if (url.pathname === "/api/quote" && symbols.has(url.searchParams.get("symbol"))) {
@@ -112,4 +121,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { normalizeChart };
+module.exports = { normalizeChart, server };

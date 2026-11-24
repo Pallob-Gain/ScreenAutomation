@@ -102,6 +102,7 @@ Read all 5 documentation files in order above
 - **Typed titles, icons, and grouped creation menu:** [README.md](README.md) → Using the application
 - **Creating groups and assigning nodes with the Group dropdown:** [README.md](README.md) → Editing, validation, and safe testing
 - **Grouped Find node tree and sample-text regex generator:** [README.md](README.md) → Editing, validation, and safe testing
+- **Repeating NVDA support/resistance paper workflow:** [README.md](README.md) → Continuous historical breakout paper workflow; [workflow JSON](tests/trading-breakout.json)
 
 #### Node Deletion
 - **Status:** CHANGES_CHECKLIST.md → Issue 3 section

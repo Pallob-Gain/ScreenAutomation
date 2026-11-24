@@ -314,6 +314,92 @@ fn paper_round_trip_fixture_verifies_both_sides_and_cannot_repeat() {
     }
 }
 
+fn arm_breakout(graph: &mut Graph) {
+    let node = graph.nodes.iter_mut().find(|node| node.name == "workflow_armed").unwrap();
+    let Kind::Constant { value, .. } = &mut node.kind else { panic!("missing arm control") };
+    *value = "true".into();
+    graph.reset_runtime();
+}
+
+fn breakout_readings(side: &str, held: usize) -> VecDeque<String> {
+    [
+        format!("{} NVDA 1 POSITION {held}", side.to_uppercase()),
+        "PAPER BREAKOUT ARMED".into(), "PAPER TRADING".into(), held.to_string(),
+        format!("Review {} order", side.to_lowercase()), "1".into(),
+        format!("Review {} order", side.to_lowercase()), "NVIDIA (NVDA)".into(), side.into(),
+        "1 shares".into(), "Market".into(), "$166.00".into(), "Order filled".into(),
+        format!("Paper order #{}. {side} 1 NVDA filled at $166.00 per share.", held + 1),
+    ].into_iter().collect()
+}
+
+#[test]
+fn paper_breakout_fixture_is_disarmed_and_repeats_verified_buy_and_sell_signals() {
+    let mut graph = Graph::from_json(include_str!("trading-breakout.json")).unwrap();
+    assert!(graph.validate().is_empty(), "{:?}", graph.validate());
+    let mut screen = Screen::new("BUY NVDA 1 POSITION 0");
+    graph.run_once(&mut screen).unwrap();
+    assert!(screen.actions.is_empty());
+    arm_breakout(&mut graph);
+    let leg = ["click", "click", "key SelectAll", "type 1", "click", "click", "key Enter"];
+    let mut completed = 0;
+    for (side, held) in (0..10).map(|held| ("Buy", held))
+        .chain((1..=10).rev().map(|held| ("Sell", held))) {
+        screen.advance(1000);
+        screen.script = breakout_readings(side, held);
+        let output = graph.run_once(&mut screen).unwrap();
+        let done = if side == "Buy" { "done" } else { "sell_done" };
+        assert!(output[done].is_some(), "{output:?}");
+        assert!(screen.script.is_empty());
+        assert!(!graph.has_pending_waits());
+        completed += 1;
+        assert_eq!(screen.actions, leg.repeat(completed));
+        screen.text = "WAIT".into();
+        graph.run_once(&mut screen).unwrap();
+        assert_eq!(screen.actions.len(), completed * 7, "busy/cooldown must not create another order");
+    }
+}
+
+#[test]
+fn paper_breakout_ignores_invalid_signals_and_fails_before_submit_on_wrong_holdings_or_side() {
+    for signal in ["WAIT", "BUY AAPL 1 POSITION 0", "BUY NVDA 2 POSITION 0",
+        "BUY NVDA 1 POSITION 10", "SELL NVDA 1 POSITION 0", "unreadable"] {
+        let mut graph = Graph::from_json(include_str!("trading-breakout.json")).unwrap();
+        arm_breakout(&mut graph);
+        let mut screen = Screen::new(signal);
+        graph.run_once(&mut screen).unwrap();
+        assert!(screen.actions.is_empty(), "{signal}");
+    }
+    for wrong_holding in [false, true] {
+        let mut graph = Graph::from_json(include_str!("trading-breakout.json")).unwrap();
+        arm_breakout(&mut graph);
+        let mut screen = Screen::new("WAIT");
+        screen.script = breakout_readings("Sell", 10);
+        if wrong_holding { screen.script[3] = "0".into(); }
+        else { screen.script[8] = "Buy".into(); }
+        let error = graph.run_once(&mut screen).unwrap_err();
+        assert!(error.contains(if wrong_holding { "sell_holding_limit" } else { "sell_check_side" }));
+        assert_eq!(screen.actions.len(), if wrong_holding { 0 } else { 5 });
+    }
+}
+
+#[test]
+fn paper_breakout_busy_signal_does_not_restart_an_order_while_a_wait_continues() {
+    let mut graph = Graph::from_json(include_str!("trading-breakout.json")).unwrap();
+    arm_breakout(&mut graph);
+    let mut screen = Screen::new("WAIT");
+    let readings = breakout_readings("Buy", 0);
+    screen.script = readings.iter().take(4).cloned().chain(["Loading".into()]).collect();
+    graph.run_once(&mut screen).unwrap();
+    assert!(graph.has_pending_waits());
+    assert_eq!(screen.actions, ["click"]);
+    screen.advance(1000);
+    screen.script = ["WAIT".into()].into_iter().chain(readings.into_iter().skip(4)).collect();
+    graph.run_once(&mut screen).unwrap();
+    assert!(!graph.has_pending_waits());
+    assert!(screen.script.is_empty());
+    assert_eq!(screen.actions, ["click", "click", "key SelectAll", "type 1", "click", "click", "key Enter"]);
+}
+
 #[derive(Default)]
 struct Fake {
     clicks: usize,

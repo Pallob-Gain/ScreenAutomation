@@ -105,6 +105,13 @@
   #orderMessage.success { color: #66e0ac; }
   .empty { color: #9aaac0; text-align: center; padding: 20px; }
   .footer-note { margin: 15px 0 0; line-height: 1.5; }
+  .breakout-panel { position: fixed; left: 24px; bottom: 24px; width: 420px; height: 310px; padding: 16px; z-index: 10; background: #111a16; border: 1px solid #42604c; border-radius: 10px; }
+  #breakoutMarker { position: absolute; top: 38px; left: 16px; font-size: 18px; line-height: 24px; color: var(--green); }
+  #breakoutCommand { position: absolute; top: 70px; left: 16px; font: 22px/30px Consolas, monospace; color: #fff; white-space: nowrap; }
+  #breakoutLevels { position: absolute; top: 110px; left: 16px; right: 16px; font-size: 13px; line-height: 20px; white-space: pre-line; }
+  #breakoutReason { position: absolute; top: 200px; left: 16px; right: 16px; font-size: 12px; line-height: 16px; }
+  .breakout-enable { position: absolute; bottom: 12px; left: 16px; right: 16px; font-size: 13px; }
+  #breakoutEnabled { width: auto; margin-right: 8px; }
   @media (max-width: 800px) {
     main { padding: 18px 16px 30px; }
     header { padding: 16px; }
@@ -261,6 +268,14 @@
     </section>
   </div>
 </main>
+<aside class="breakout-panel" id="breakoutPanel" aria-label="Paper breakout indicator" hidden>
+  <h2>20-bar support / resistance</h2>
+  <div id="breakoutMarker">PAPER BREAKOUT DISARMED</div>
+  <div id="breakoutCommand" role="status">WAIT</div>
+  <div id="breakoutLevels">20 completed 1-minute bars / 0.1% buffer</div>
+  <div id="breakoutReason">Indicator only: orders require the screen workflow. One share, max 10, no shorts. Disarming blocks orders until reload.</div>
+  <label class="breakout-enable"><input id="breakoutEnabled" type="checkbox">Enable guarded paper signals (no automatic orders)</label>
+</aside>
 <dialog id="reviewDialog" aria-labelledby="reviewTitle" aria-describedby="reviewDisclaimer">
   <div class="eyebrow">STEP 2 OF 2 / PAPER TRADE</div>
   <h2 id="reviewTitle">Review order</h2>
@@ -288,9 +303,16 @@
   <p id="confirmationSummary"></p>
   <button type="button" class="trade-button" id="doneOrder">Done</button>
 </dialog>
+<script src="breakout-study.js"></script>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
+  if (typeof PaperBreakout === "undefined") {
+    $("quoteStatus").textContent = "Indicator module unavailable. Restart trading-server.js and open the server URL.";
+    $("orderMessage").textContent = "Paper trading disabled until the page dependency loads.";
+    $("reviewOrder").disabled = true;
+    return;
+  }
   const instruments = {
     NVDA: { name: "NVIDIA", public: true },
     AAPL: { name: "Apple", public: true },
@@ -304,6 +326,7 @@
     asset.error = asset.public ? "Loading quote..." : "No public stock-market quote.";
     asset.history = [];
     asset.historyRange = null;
+    asset.bars = [];
     asset.high = null;
     asset.low = null;
     asset.volume = null;
@@ -322,6 +345,12 @@
   let reviewOrder = null;
   let nextOrderId = 1;
   const orders = [];
+  const breakoutVisible = new URLSearchParams(location.search).get("breakout") === "1";
+  const breakout = new PaperBreakout.BreakoutStudy();
+  let breakoutLatched = false;
+  let lastSubmittedAt = -Infinity;
+  let cooldownUntil = 0;
+  $("breakoutPanel").hidden = !breakoutVisible;
   const money = (cents) => (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
   const selected = () => instruments[$("instrument").value];
   const rangeLabels = { "1d": "1-minute bars", "5d": "5-minute bars", "1mo": "30-minute bars" };
@@ -360,7 +389,40 @@
     const total = order.quantity * (order.type === "Limit" ? order.limit : asset.price);
     if (order.side === "Buy" && total > buyingPower()) return "Not enough buying power. Open buy orders reserve cash.";
     if (order.side === "Sell" && order.quantity > availableShares(order.symbol)) return "Not enough available shares. Open sell orders reserve shares.";
+    const breakoutError = PaperBreakout.orderError(order, breakoutState());
+    if (breakoutError) return breakoutError;
     return "";
+  }
+
+  function breakoutState() {
+    const now = Date.now();
+    const asset = selected();
+    const enabled = breakoutVisible && $("breakoutEnabled").checked;
+    const snapshot = enabled ? breakout.update({
+      symbol: $("instrument").value, range: chartRange === "1d" ? asset.historyRange : chartRange, price: asset.price / 100,
+      time: asset.quoteTime, error: asset.error, bars: asset.bars
+    }, now) : { ready: false, phase: "Idle", reason: "Paper breakout is disarmed.", levels: null };
+    if (!enabled) breakout.reset();
+    return { enabled, latched: breakoutLatched, snapshot, now, lastSubmittedAt, cooldownUntil,
+      busy: $("reviewDialog").open || $("confirmationDialog").open,
+      shares: asset.shares, hasOpenOrders: orders.some((order) => order.status === "Open"),
+      buyingPower: buyingPower(), price: asset.price };
+  }
+
+  function renderBreakout() {
+    if (!breakoutVisible) return;
+    const state = breakoutState();
+    $("breakoutMarker").textContent = `PAPER BREAKOUT ${state.enabled ? "ARMED" : "DISARMED"}`;
+    $("breakoutCommand").textContent = PaperBreakout.command(state);
+    const levels = state.snapshot.levels;
+    $("breakoutLevels").textContent = levels
+      ? `Buy start > $${levels.buyStart.toFixed(4)} / stop < $${levels.resistance.toFixed(4)}\nSell start < $${levels.sellStart.toFixed(4)} / stop > $${levels.support.toFixed(4)}\n20 completed 1-minute bars / ${state.snapshot.phase} phase\nNVDA owned: ${state.shares} / maximum 10`
+      : "20 completed 1-minute bars / 0.1% buffer\nOne share per order / maximum 10 / no shorts";
+    const blocked = state.enabled
+      ? PaperBreakout.orderError({ symbol: "NVDA", type: "Market", quantity: 1, side: state.snapshot.phase }, state)
+      : "Indicator only. Disarming blocks orders until reload.";
+    $("breakoutReason").textContent = state.busy ? "Order in progress; no new signal."
+      : state.snapshot.reason + (blocked && blocked !== state.snapshot.reason ? ` ${blocked}` : "");
   }
 
   function renderChart(asset) {
@@ -464,6 +526,7 @@
     $("sell").setAttribute("aria-pressed", String(orderSide === "Sell"));
     renderChart(selected());
     if (reviewOrder) renderReview();
+    renderBreakout();
   }
 
   function renderOrders() {
@@ -553,9 +616,10 @@
     reviewOrder = order;
     renderReview();
     $("reviewDialog").showModal();
+    renderBreakout();
   });
   $("editOrder").addEventListener("click", () => $("reviewDialog").close());
-  $("reviewDialog").addEventListener("close", () => { reviewOrder = null; });
+  $("reviewDialog").addEventListener("close", () => { reviewOrder = null; renderBreakout(); });
   $("confirmOrder").addEventListener("click", () => {
     if (!reviewOrder) return;
     const error = validateOrder(reviewOrder);
@@ -565,6 +629,7 @@
       return;
     }
     $("confirmOrder").disabled = true;
+    lastSubmittedAt = Date.now();
     const order = {
       ...reviewOrder, id: nextOrderId++, status: "Open", price: null,
       time: new Date().toLocaleTimeString("en-US"),
@@ -580,8 +645,18 @@
     renderConfirmation(order);
     message(`Paper order #${order.id}: ${order.status.toLowerCase()}.`, "success");
     $("confirmationDialog").showModal();
+    renderBreakout();
   });
   $("doneOrder").addEventListener("click", () => $("confirmationDialog").close());
+  $("confirmationDialog").addEventListener("close", () => {
+    cooldownUntil = Date.now() + 1000;
+    renderBreakout();
+  });
+  $("breakoutEnabled").addEventListener("change", () => {
+    breakoutLatched = breakoutLatched || $("breakoutEnabled").checked;
+    breakout.reset();
+    render();
+  });
   $("orderHistory").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-cancel]");
     if (!button) return;
@@ -664,6 +739,7 @@
         asset.error = "";
         asset.history = data.history.map((point) => ({ time: point.time, price: Math.round(point.price * 100) }));
         asset.historyRange = data.range;
+        asset.bars = Array.isArray(data.bars) ? data.bars : [];
         asset.high = Number.isFinite(data.high) && data.high > 0 ? Math.round(data.high * 100) : null;
         asset.low = Number.isFinite(data.low) && data.low > 0 ? Math.round(data.low * 100) : null;
         asset.volume = Number.isFinite(data.volume) && data.volume > 0 ? data.volume : null;
@@ -679,6 +755,10 @@
   }
   $("refreshPrices").addEventListener("click", refreshQuotes);
   setInterval(refreshQuotes, 15000);
+  setInterval(() => {
+    renderBreakout();
+    if (reviewOrder && breakoutLatched) renderReview();
+  }, 250);
   render();
   refreshQuotes();
 })();
