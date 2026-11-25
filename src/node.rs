@@ -3,8 +3,34 @@ use crate::graph::Graph;
 use rhai::{Dynamic, Engine, Scope};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+
+/// The scripting language of a Function node. Both languages share the same interface:
+/// `inputs`, named input variables, `state`, `workflow_busy`, and `elapsed_ms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptLanguage {
+    #[default]
+    Rhai,
+    Javascript,
+}
+
+impl ScriptLanguage {
+    pub const ALL: [Self; 2] = [Self::Rhai, Self::Javascript];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rhai => "Rhai",
+            Self::Javascript => "JavaScript",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -262,9 +288,15 @@ pub enum Kind {
         value: String,
         format: Format,
     },
-    /// Rhai script: `inputs` array in scope; the last expression is the result. `()` stops the flow.
+    /// Rhai or JavaScript script: `inputs` array in scope; the last expression is the result.
+    /// `()` (Rhai) or `undefined`/`null` (JavaScript) stops the flow. Optional named inputs add
+    /// one single-connection pin per name, bound as a script variable.
     Function {
         code: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        input_names: Vec<String>,
+        #[serde(default, skip_serializing_if = "ScriptLanguage::is_default")]
+        language: ScriptLanguage,
     },
     /// Passes the input on when `input <op> value` holds; otherwise stops the flow.
     Compare {
@@ -394,6 +426,14 @@ pub struct Node {
     pub input_parameters: Vec<InputParameter>,
     #[serde(skip)]
     parameter_values: Vec<Option<Value>>,
+    #[serde(skip)]
+    function_state: HashMap<String, Value>,
+    #[serde(skip)]
+    function_started: Option<Instant>,
+    #[serde(skip)]
+    function_code: String,
+    #[serde(skip)]
+    pub(crate) workflow_busy: bool,
     #[serde(default)]
     pub position: [f32; 2],
     #[serde(default)]
@@ -416,6 +456,10 @@ impl Node {
             kind,
             input_parameters: Vec::new(),
             parameter_values: Vec::new(),
+            function_state: HashMap::new(),
+            function_started: None,
+            function_code: String::new(),
+            workflow_busy: false,
             position: [0.0, 0.0],
             region: has_region.then(Region::default),
             color: [0, 170, 255],
@@ -433,6 +477,10 @@ impl Node {
 
     pub(crate) fn reset_runtime(&mut self) {
         self.parameter_values.clear();
+        self.function_state.clear();
+        self.function_started = None;
+        self.function_code.clear();
+        self.workflow_busy = false;
         match &mut self.kind {
             Kind::Ocr { last_hash, .. } => *last_hash = None,
             Kind::Compare { last, .. } => *last = None,
@@ -450,12 +498,21 @@ impl Node {
     }
 
     pub fn input_count(&self) -> usize {
-        match self.kind {
+        match &self.kind {
             Kind::Ocr { .. } | Kind::Constant { .. } | Kind::Event { .. }
             | Kind::Note { .. } | Kind::SubflowInput => 0,
             Kind::CompareInputs { .. } => 2,
+            Kind::Function { input_names, .. } if !input_names.is_empty() => input_names.len(),
             _ if !self.available_input_parameters().is_empty() => 1 + self.input_parameters.len(),
             _ => 1,
+        }
+    }
+
+    /// Names of this Function node's named input pins; empty for every other configuration.
+    pub fn named_function_inputs(&self) -> &[String] {
+        match &self.kind {
+            Kind::Function { input_names, .. } => input_names,
+            _ => &[],
         }
     }
 
@@ -485,13 +542,20 @@ impl Node {
         self.input_parameters.iter().position(|&p| p == parameter).map(|p| p + 1)
     }
 
-    pub fn input_label(&self, port: usize) -> &'static str {
+    pub fn input_label(&self, port: usize) -> &str {
+        if let Some(name) = self.named_function_inputs().get(port) {
+            return name;
+        }
         match (port, &self.kind) {
             (0, Kind::CompareInputs { .. }) => "A",
             (1, Kind::CompareInputs { .. }) => "B",
             (0, _) => "Input",
             (port, _) => self.input_parameters.get(port - 1).map_or("Input", |p| p.label()),
         }
+    }
+
+    pub fn validate_function_inputs(&self) -> Result<(), String> {
+        validate_input_names(self.named_function_inputs())
     }
 
     pub(crate) fn validate_input_parameters(&self) -> Result<(), String> {
@@ -507,7 +571,9 @@ impl Node {
     }
 
     pub(crate) fn has_single_connection_ports(&self) -> bool {
-        !self.input_parameters.is_empty() || matches!(self.kind, Kind::CompareInputs { .. })
+        !self.input_parameters.is_empty()
+            || !self.named_function_inputs().is_empty()
+            || matches!(self.kind, Kind::CompareInputs { .. })
     }
 
     pub fn output_count(&self) -> usize {
@@ -552,6 +618,10 @@ impl Node {
     }
 
     pub(crate) fn reset_input_state(&mut self) {
+        if matches!(self.kind, Kind::Function { .. }) {
+            self.reset_runtime();
+            return;
+        }
         if !self.input_parameters.is_empty() {
             self.reset_runtime();
             return;
@@ -574,6 +644,9 @@ impl Node {
         backend: &mut dyn Backend,
         depth: usize,
     ) -> Result<Option<Value>, String> {
+        if !self.named_function_inputs().is_empty() {
+            return self.evaluate_function(inputs, backend);
+        }
         if let Kind::CompareInputs { values, .. } = &mut self.kind {
             for (cached, incoming) in values.iter_mut().zip(inputs) {
                 if let Some(value) = incoming {
@@ -606,6 +679,50 @@ impl Node {
             return Ok(None);
         }
         self.evaluate(&[main], backend, depth)
+    }
+
+    /// Evaluates a Function node's script. `slots` holds one entry per input pin; named inputs
+    /// are bound as variables, reading `()` (Rhai) or `undefined` (JavaScript) where a pin
+    /// produced no value this evaluation.
+    fn evaluate_function(
+        &mut self,
+        slots: &[Option<Value>],
+        backend: &mut dyn Backend,
+    ) -> Result<Option<Value>, String> {
+        self.validate_function_inputs()?;
+        let (code, input_names, language) = match &self.kind {
+            Kind::Function { code, input_names, language } => {
+                (code.clone(), input_names.clone(), *language)
+            }
+            _ => return Err("not a Function node".into()),
+        };
+        // The language and named inputs are part of the script's interface: changing them
+        // invalidates persistent state exactly like editing the script itself.
+        let mut signature = format!("{language:?}\u{1f}{}\u{1f}", input_names.join("\u{1f}"));
+        signature.push_str(&code);
+        if self.function_code != signature {
+            self.function_state.clear();
+            self.function_started = None;
+            self.function_code = signature;
+        }
+        let now = backend.now();
+        let started = *self.function_started.get_or_insert(now);
+        let elapsed_ms = i64::try_from(now.duration_since(started).as_millis())
+            .map_err(|_| "Function runtime exceeds the supported elapsed time")?;
+        let script = ScriptRun {
+            code: &code,
+            input_names: &input_names,
+            slots,
+            state: &self.function_state,
+            workflow_busy: self.workflow_busy,
+            elapsed_ms,
+        };
+        let (output, next_state) = match language {
+            ScriptLanguage::Rhai => evaluate_rhai(&script)?,
+            ScriptLanguage::Javascript => evaluate_javascript(&script)?,
+        };
+        self.function_state = next_state;
+        Ok(output)
     }
 
     /// Recognizes an already captured event frame without taking another screenshot.
@@ -663,6 +780,10 @@ impl Node {
         };
         let region = self.region.unwrap_or_default();
         let hysteresis = matches!(self.kind, Kind::Hysteresis { .. });
+        if matches!(self.kind, Kind::Function { .. }) {
+            let slots: Vec<Option<Value>> = inputs.iter().cloned().map(Some).collect();
+            return self.evaluate_function(&slots, backend);
+        }
         match &mut self.kind {
             Kind::Ocr { single_line, last_hash } => {
                 let pixels = backend.capture(&region)?;
@@ -671,16 +792,7 @@ impl Node {
             Kind::Model { format } => Ok(inputs.first().and_then(|v| convert(v, *format))),
             Kind::Constant { value, format } => convert(&Value::Text(value.clone()), *format)
                 .map(Some).ok_or_else(|| format!("Constant '{}' cannot convert '{}' to {format:?}", self.name, value)),
-            Kind::Function { code } => {
-                let engine = Engine::new();
-                let arr: rhai::Array = inputs.iter().map(to_dynamic).collect();
-                let mut scope = Scope::new();
-                scope.push("inputs", arr);
-                let out: Dynamic = engine
-                    .eval_with_scope(&mut scope, code)
-                    .map_err(|e| e.to_string())?;
-                Ok(from_dynamic(out))
-            }
+            Kind::Function { .. } => unreachable!("Function nodes are evaluated above"),
             Kind::Compare {
                 op,
                 value,
@@ -1086,6 +1198,205 @@ fn to_dynamic(v: &Value) -> Dynamic {
         Value::Num(n) => (*n).into(),
         Value::Text(s) => s.clone().into(),
     }
+}
+
+/// One Function-node script evaluation: the source plus every binding the script can read.
+/// Evaluators return the output and the next persistent state; errors leave the node's
+/// previous state untouched.
+struct ScriptRun<'a> {
+    code: &'a str,
+    input_names: &'a [String],
+    slots: &'a [Option<Value>],
+    state: &'a HashMap<String, Value>,
+    workflow_busy: bool,
+    elapsed_ms: i64,
+}
+
+type ScriptOutcome = Result<(Option<Value>, HashMap<String, Value>), String>;
+
+fn state_error(key: &str) -> String {
+    format!("state value '{key}' must be text, a finite number, or a boolean")
+}
+
+fn evaluate_rhai(run: &ScriptRun) -> ScriptOutcome {
+    let engine = Engine::new();
+    let mut scope = Scope::new();
+    let inputs: rhai::Array = run.slots.iter()
+        .map(|slot| slot.as_ref().map_or(Dynamic::UNIT, to_dynamic))
+        .collect();
+    scope.push("inputs", inputs);
+    for (name, slot) in run.input_names.iter().zip(run.slots) {
+        scope.push_dynamic(name.as_str(), slot.as_ref().map_or(Dynamic::UNIT, to_dynamic));
+    }
+    let state: rhai::Map = run.state.iter()
+        .map(|(key, value)| (key.as_str().into(), to_dynamic(value)))
+        .collect();
+    scope.push("state", state);
+    scope.push_constant("workflow_busy", run.workflow_busy);
+    scope.push_constant("elapsed_ms", run.elapsed_ms);
+    let out: Dynamic = engine
+        .eval_with_scope(&mut scope, run.code)
+        .map_err(|e| e.to_string())?;
+    let state: rhai::Map = scope
+        .get_value("state")
+        .ok_or("the 'state' variable must remain a map")?;
+    let mut next_state = HashMap::with_capacity(state.len());
+    for (key, value) in state {
+        let value = rhai_state_value(value).ok_or_else(|| state_error(&key))?;
+        next_state.insert(key.to_string(), value);
+    }
+    Ok((from_dynamic(out), next_state))
+}
+
+/// Persistent state only keeps plain values; collections cannot round-trip through saves.
+fn rhai_state_value(d: Dynamic) -> Option<Value> {
+    if let Some(b) = d.clone().try_cast::<bool>() {
+        return Some(Value::Bool(b));
+    }
+    if let Some(i) = d.clone().try_cast::<i64>() {
+        return Some(Value::Int(i));
+    }
+    if let Some(f) = d.clone().try_cast::<f64>() {
+        return f.is_finite().then(|| Value::Num(f));
+    }
+    d.try_cast::<rhai::ImmutableString>().map(|s| Value::Text(s.to_string()))
+}
+
+fn evaluate_javascript(run: &ScriptRun) -> ScriptOutcome {
+    use boa_engine::object::builtins::JsArray;
+    use boa_engine::object::ObjectInitializer;
+    use boa_engine::property::Attribute;
+    use boa_engine::{Context, JsString, JsValue, Source};
+
+    fn slot_js(slot: &Option<Value>) -> JsValue {
+        slot.as_ref().map_or_else(JsValue::undefined, value_to_js)
+    }
+    let js_err = |e: boa_engine::JsError| e.to_string();
+
+    let mut context = Context::default();
+    let inputs = JsArray::from_iter(run.slots.iter().map(slot_js), &mut context);
+    context
+        .register_global_property(JsString::from("inputs"), inputs, Attribute::all())
+        .map_err(js_err)?;
+    for (name, slot) in run.input_names.iter().zip(run.slots) {
+        context
+            .register_global_property(JsString::from(name.as_str()), slot_js(slot), Attribute::all())
+            .map_err(js_err)?;
+    }
+    let mut state = ObjectInitializer::new(&mut context);
+    for (key, value) in run.state {
+        state.property(JsString::from(key.as_str()), value_to_js(value), Attribute::all());
+    }
+    let state = state.build();
+    context
+        .register_global_property(JsString::from("state"), state, Attribute::all())
+        .map_err(js_err)?;
+    context
+        .register_global_property(JsString::from("workflow_busy"), run.workflow_busy, Attribute::all())
+        .map_err(js_err)?;
+    // JavaScript numbers are doubles; elapsed times stay exact for ~285,000 years.
+    context
+        .register_global_property(JsString::from("elapsed_ms"), run.elapsed_ms as f64, Attribute::all())
+        .map_err(js_err)?;
+
+    let out = context
+        .eval(Source::from_bytes(run.code.as_bytes()))
+        .map_err(js_err)?;
+
+    // Read `state` back through the script scope so a `let state = {...}` rebinding counts.
+    let state = context.eval(Source::from_bytes(b"state")).map_err(js_err)?;
+    let Some(state) = state.as_object() else {
+        return Err("the 'state' variable must remain an object".into());
+    };
+    let keys = context
+        .eval(Source::from_bytes(b"JSON.stringify(Object.keys(state))"))
+        .map_err(js_err)?;
+    let keys = keys
+        .as_string()
+        .map(|s| s.to_std_string_escaped())
+        .ok_or("cannot list the state keys")?;
+    let keys: Vec<String> =
+        serde_json::from_str(&keys).map_err(|e| format!("cannot list the state keys: {e}"))?;
+    let mut next_state = HashMap::with_capacity(keys.len());
+    for key in keys {
+        let value = state.get(JsString::from(key.as_str()), &mut context).map_err(js_err)?;
+        let value = js_state_value(&value).ok_or_else(|| state_error(&key))?;
+        next_state.insert(key, value);
+    }
+    Ok((js_output(out, &mut context)?, next_state))
+}
+
+fn value_to_js(v: &Value) -> boa_engine::JsValue {
+    use boa_engine::{JsString, JsValue};
+    match v {
+        Value::Bool(b) => JsValue::from(*b),
+        // JavaScript numbers are doubles; huge Int values round exactly like JS literals would.
+        Value::Int(i) => JsValue::from(*i as f64),
+        Value::Num(n) => JsValue::from(*n),
+        Value::Text(s) => JsValue::from(JsString::from(s.as_str())),
+    }
+}
+
+/// Largest integer a JavaScript double represents exactly (2^53).
+const JS_SAFE_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+/// Converts the script's completion value to a node output. `undefined`/`null` stop the flow;
+/// integral numbers in the safe range become Int so downstream formatting matches Rhai.
+fn js_output(
+    value: boa_engine::JsValue,
+    context: &mut boa_engine::Context,
+) -> Result<Option<Value>, String> {
+    if value.is_null_or_undefined() {
+        return Ok(None);
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(Some(Value::Bool(b)));
+    }
+    if let Some(n) = value.as_number() {
+        let integral = n.fract() == 0.0 && n.abs() <= JS_SAFE_INTEGER;
+        return Ok(Some(if integral { Value::Int(n as i64) } else { Value::Num(n) }));
+    }
+    if let Some(s) = value.as_string() {
+        return Ok(Some(Value::Text(s.to_std_string_escaped())));
+    }
+    let text = value.to_string(context).map_err(|e| e.to_string())?;
+    Ok(Some(Value::Text(text.to_std_string_escaped())))
+}
+
+fn js_state_value(value: &boa_engine::JsValue) -> Option<Value> {
+    if let Some(b) = value.as_boolean() {
+        return Some(Value::Bool(b));
+    }
+    if let Some(n) = value.as_number() {
+        if !n.is_finite() {
+            return None;
+        }
+        let integral = n.fract() == 0.0 && n.abs() <= JS_SAFE_INTEGER;
+        return Some(if integral { Value::Int(n as i64) } else { Value::Num(n) });
+    }
+    value.as_string().map(|s| Value::Text(s.to_std_string_escaped()))
+}
+
+/// Checks Function input pin names: valid Rhai identifiers, unique, and not shadowing the
+/// built-in `inputs`, `state`, `workflow_busy`, or `elapsed_ms` bindings.
+pub fn validate_input_names(names: &[String]) -> Result<(), String> {
+    for (i, name) in names.iter().enumerate() {
+        let mut chars = name.chars();
+        let identifier = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !identifier {
+            return Err(format!(
+                "input name '{name}' must start with a letter or '_' and contain only letters, digits, and '_'"
+            ));
+        }
+        if matches!(name.as_str(), "inputs" | "state" | "workflow_busy" | "elapsed_ms") {
+            return Err(format!("input name '{name}' is reserved"));
+        }
+        if names[..i].contains(name) {
+            return Err(format!("duplicate input name '{name}'"));
+        }
+    }
+    Ok(())
 }
 
 fn from_dynamic(d: Dynamic) -> Option<Value> {

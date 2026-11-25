@@ -10,7 +10,7 @@ use screen_automation::{
     backend::{Backend, KeyAction, Region},
     desktop::Desktop,
     graph::{EventRuntime, Graph, GraphSettings, NodeEvent, RunMode, DEFAULT_REFRESH_MS},
-    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, TextMatch, Value},
+    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, ScriptLanguage, TextMatch, Value},
     session_log::SessionLog,
     screen_events::{ScreenEvents, ScreenRegion},
     event_sources::{EventRegistration, EventSource, EventSources},
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 mod editor;
@@ -72,6 +72,7 @@ struct App {
     group_dialog: Option<GroupDialog>,
     regex_dialog: Option<RegexDialog>,
     running: bool,
+    overlays_enabled: bool,
     overlays_hidden: bool,
     overlay_ready_at: Option<Instant>,
     last_tick: Instant,
@@ -90,6 +91,8 @@ struct App {
     escape_pressed: Arc<AtomicBool>,
     overlay_anchors: HashMap<String, Region>,
     overlay_targets: HashMap<String, (Region, u8)>,
+    overlay_clicks: Arc<Mutex<Vec<String>>>,
+    overlay_paint: HashMap<String, OverlayPaint>,
     file: Option<PathBuf>,
     saved_graph: String,
     pending_file_action: Option<FileAction>,
@@ -107,6 +110,7 @@ struct App {
     validation_open: bool,
     validation: Vec<screen_automation::graph::GraphIssue>,
     preview: Option<PreviewSession>,
+    pending_preview: Option<bool>,
     preview_steps: Vec<StepResult>,
     preview_open: bool,
     subflow_editor: Option<(String, Box<App>)>,
@@ -344,10 +348,25 @@ fn visit_nodes_mut(graph: &mut Graph, prefix: &str, visit: &mut impl FnMut(&mut 
 
 struct OverlayState<'a> {
     selected: Option<&'a str>,
-    clicked: Option<String>,
+    clicks: Arc<Mutex<Vec<String>>>,
+    any_visible: bool,
     scales: &'a mut HashMap<String, f32>,
     anchors: &'a mut HashMap<String, Region>,
     targets: &'a mut HashMap<String, (Region, u8)>,
+    paint: &'a mut HashMap<String, OverlayPaint>,
+}
+
+/// Everything a deferred overlay window needs to paint itself. Parent frames re-register the
+/// window callback with a fresh copy and request a repaint of that window when it changes.
+#[derive(Clone, PartialEq)]
+struct OverlayPaint {
+    label: String,
+    fill: Color32,
+    outline: Color32,
+    title: Color32,
+    selected: bool,
+    locked: bool,
+    hidden: bool,
 }
 
 const WIRE_FLASH: Duration = Duration::from_millis(1000);
@@ -488,7 +507,7 @@ fn node_description(node: &Node) -> String {
             Format::Bool => "Convert input to boolean",
         }
         .into(),
-        Kind::Function { .. } => "Evaluate a Rhai expression".into(),
+        Kind::Function { language, .. } => format!("Evaluate a {} expression", language.label()),
         Kind::Compare { op, value, .. } => {
             let value = parameter_text(node, InputParameter::CompareValue, value);
             format!("Trigger if input {} {value}", op.symbol())
@@ -657,6 +676,8 @@ fn new_kind(i: usize) -> Kind {
         },
         2 => Kind::Function {
             code: "inputs[0]".into(),
+            input_names: Vec::new(),
+            language: ScriptLanguage::Rhai,
         },
         3 => Kind::Compare {
             op: CompareOp::Greater,
@@ -1376,6 +1397,9 @@ impl App {
                     self.preview_run(true);
                     ui.close();
                 }
+                ui.separator();
+                ui.checkbox(&mut self.overlays_enabled, "Show region overlays")
+                    .on_hover_text("Floating capture-region windows. They repaint independently of the canvas; hide them to reduce window clutter. The selected node's overlay stays visible, and runs, dry runs, and saved regions are unaffected.");
             });
             ui.menu_button("Settings", |ui| {
                 if ui.button("Run timing...").clicked() {
@@ -1750,6 +1774,8 @@ impl App {
         let mut open = true;
         let mut delete = false;
         let mut parameter_changes = Vec::new();
+        let mut function_input_added = false;
+        let mut function_input_removed: Option<usize> = None;
         let mut screen_action_changed = false;
         let groups: Vec<_> = self.graph.group_names().into_iter().map(str::to_owned).collect();
         let mut selected_group = self.graph.nodes[index].group.clone();
@@ -1822,12 +1848,52 @@ impl App {
                         format_settings(settings, format);
                         settings.weak("Outputs the configured value on every workflow tick.");
                     }
-                    Kind::Function { code } => {
-                        settings.label("Rhai expression");
+                    Kind::Function { code, input_names, language } => {
+                        settings.label("Named inputs");
+                        for (slot, name) in input_names.iter_mut().enumerate() {
+                            settings.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .id(Id::new(("function-input-name", index, slot)))
+                                        .desired_width(150.0),
+                                );
+                                if ui.button("Remove")
+                                    .on_hover_text("Remove this input pin. Its wire is dropped and wires on later pins move up.")
+                                    .clicked()
+                                {
+                                    function_input_removed = Some(slot);
+                                }
+                            });
+                        }
+                        if let Err(error) = screen_automation::node::validate_input_names(input_names) {
+                            settings.colored_label(Color32::RED, error);
+                        }
+                        if settings.button("Add named input").clicked() {
+                            function_input_added = true;
+                        }
+                        settings.weak(
+                            "Each named input is its own pin with at most one wire, available in the \
+                             script as a variable; it reads () in Rhai or undefined in JavaScript \
+                             when its pin has no new value this evaluation. Without names, the single \
+                             pin accepts multiple wires. The 'inputs' array always lists this \
+                             evaluation's values. Renaming, adding, or removing inputs clears the \
+                             saved state.",
+                        );
+                        settings.separator();
+                        settings.horizontal(|ui| {
+                            for choice in ScriptLanguage::ALL {
+                                ui.selectable_value(language, choice, choice.label());
+                            }
+                        });
+                        settings.label(format!("{} expression", language.label()));
                         settings.add(
                             egui::TextEdit::multiline(code)
                                 .code_editor()
                                 .desired_rows(5),
+                        );
+                        settings.weak(
+                            "The last expression is the result; () in Rhai and undefined/null in \
+                             JavaScript stop the flow. Switching the language clears the saved state.",
                         );
                     }
                     Kind::Compare {
@@ -2084,6 +2150,27 @@ impl App {
             self.set_running(false);
             self.record_status(log::Level::Info,
                 "Screen action settings changed. Pending waits cancelled; review the workflow before running again.".into());
+        }
+        if !delete && (function_input_added || function_input_removed.is_some()) {
+            self.sync_graph_positions();
+            let name = self.graph.nodes[index].name.clone();
+            self.set_running(false);
+            let result = match function_input_removed {
+                Some(slot) => self.graph.remove_function_input(&name, slot),
+                None => {
+                    let taken = self.graph.nodes[index].named_function_inputs().to_vec();
+                    let fresh = (1..).map(|i| format!("input_{i}"))
+                        .find(|candidate| !taken.contains(candidate))
+                        .expect("an unused name always exists");
+                    self.graph.add_function_input(&name, &fresh)
+                }
+            };
+            if let Err(error) = result {
+                self.record_status(log::Level::Error, error);
+                return;
+            }
+            self.rebuild_snarl();
+            self.record_status(log::Level::Info, "Updated Function input pins".into());
         }
         if !delete && !parameter_changes.is_empty() {
             self.sync_graph_positions();
@@ -2432,23 +2519,31 @@ impl App {
     }
 
     fn show_overlays(&mut self, ctx: &egui::Context) {
-        let running = self.running;
-        let visibility_changed = self.overlays_hidden != running;
+        let running = self.running || self.has_pending_preview();
+        let enabled = self.overlays_enabled;
         let locked = self.pending_file_action.is_some() || self.recovery.is_some()
             || self.recovery_error.is_some() || self.editing_dialog_open();
         let selected = self.selected_overlay_key();
-        let clicked = {
+        let any_visible = {
             let mut state = OverlayState {
                 selected: selected.as_deref(),
-                clicked: None,
+                clicks: Arc::clone(&self.overlay_clicks),
+                any_visible: false,
                 scales: &mut self.region_scales,
                 anchors: &mut self.overlay_anchors,
                 targets: &mut self.overlay_targets,
+                paint: &mut self.overlay_paint,
             };
             visit_nodes_mut(&mut self.graph, "", &mut |node, key| {
-                Self::overlay_node(ctx, node, key, running, locked, &mut state);
+                Self::overlay_node(ctx, node, key, running, enabled, locked, &mut state);
             });
-            state.clicked
+            state.any_visible
+        };
+        let clicked = {
+            let mut clicks = self.overlay_clicks.lock().expect("overlay clicks");
+            let last = clicks.pop();
+            clicks.clear();
+            last
         };
         if let Some(key) = clicked {
             if let Err(error) = self.select_overlay_key(&key) {
@@ -2456,18 +2551,24 @@ impl App {
             }
             ctx.request_repaint();
         }
-        if visibility_changed {
-            self.overlays_hidden = running;
-            self.overlay_ready_at = running.then(|| Instant::now() + OVERLAY_SETTLE_DELAY);
+        let hidden = !any_visible;
+        if self.overlays_hidden != hidden {
+            self.overlays_hidden = hidden;
+            self.overlay_ready_at = hidden.then(|| Instant::now() + OVERLAY_SETTLE_DELAY);
             ctx.request_repaint();
         }
     }
 
-    fn overlay_node(ctx: &egui::Context, node: &mut Node, key: &str, running: bool, locked: bool, state: &mut OverlayState<'_>) {
+    fn overlay_node(ctx: &egui::Context, node: &mut Node, key: &str, running: bool, enabled: bool, locked: bool, state: &mut OverlayState<'_>) {
         let Some(region) = node.region else {
             return;
         };
-        if running && ctx.embed_viewports() {
+        let selected = state.selected == Some(key);
+        // The selected node's overlay stays visible while editing so regions can be positioned
+        // one at a time even with the other overlay windows hidden.
+        let hidden = running || (!enabled && !selected);
+        state.any_visible |= !hidden;
+        if hidden && ctx.embed_viewports() {
             return;
         }
         // The builder position/size must stay constant: egui re-applies any change to it as a
@@ -2484,14 +2585,14 @@ impl App {
         let id = ViewportId::from_hash_of(("overlay", key));
         let builder = ViewportBuilder::default()
             .with_title(node_window_title(node))
-            .with_visible(!running)
+            .with_visible(!hidden)
             .with_decorations(false)
             .with_transparent(true)
             .with_has_shadow(false)
             .with_resizable(true)
             .with_min_inner_size(overlay_min_inner_size())
             .with_always_on_top()
-            .with_mouse_passthrough(running || locked)
+            .with_mouse_passthrough(hidden || locked)
             .with_position([
                 anchor.x as f32 - OVERLAY_MARGIN,
                 anchor.y as f32 - OVERLAY_HEADER,
@@ -2502,70 +2603,32 @@ impl App {
             ]);
         let [red, green, blue] = node.color;
         let alpha = (node.opacity.clamp(0.0, 1.0) * 255.0) as u8;
-        let fill = Color32::from_rgba_unmultiplied(red, green, blue, alpha);
-        let outline = Color32::from_rgba_unmultiplied(255, 40, 40, alpha);
-        let title = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
-        let name = key.to_owned();
         let style = node_style(node.type_name());
-        let label = format!("{} {}\n{}", style.icon, style.label, node.display_title());
-        let selected = state.selected == Some(key);
-        ctx.show_viewport_immediate(id, builder, |ctx, _| {
-            if running { return; }
-            let viewport_ctx = ctx.clone();
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let rect = ui.max_rect();
-                    let grip = paint_overlay(ui, rect, &label, fill, outline, title, selected);
-                    let drag = ui.interact(rect, ui.id().with("move-overlay"), egui::Sense::click_and_drag());
-                    if drag.drag_started()
-                        && drag
-                            .interact_pointer_pos()
-                            .is_some_and(|position| !grip.contains(position))
-                    {
-                        viewport_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    let resize =
-                        ui.interact(grip, ui.id().with("resize-grip"), egui::Sense::drag());
-                    if !locked && (drag.clicked() || drag.drag_started() || resize.drag_started()) {
-                        state.clicked = Some(name.clone());
-                    }
-                    let start_size_id = Id::new(("overlay-resize-start", &name));
-                    let start_pos_id = Id::new(("overlay-resize-start-pos", &name));
-                    if resize.drag_started() {
-                        if let Some(pos) = ui.ctx().pointer_latest_pos() {
-                            viewport_ctx.data_mut(|data| {
-                                data.insert_temp(start_size_id, rect.size());
-                                data.insert_temp(start_pos_id, pos);
-                            });
-                        }
-                    }
-                    if resize.dragged() {
-                        let start_size =
-                            viewport_ctx.data(|data| data.get_temp::<egui::Vec2>(start_size_id));
-                        if let (Some(start_size), Some(current_pos)) =
-                            (start_size, ui.ctx().pointer_latest_pos())
-                        {
-                            let start_pos = viewport_ctx
-                                .data(|data| data.get_temp::<egui::Pos2>(start_pos_id))
-                                .unwrap_or(current_pos);
-                            let delta = current_pos - start_pos;
-                            let size = (start_size + egui::vec2(delta.x, delta.y)).max(overlay_min_inner_size());
-                            viewport_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                                size,
-                            ));
-                        }
-                    }
-                    if resize.drag_stopped() {
-                        viewport_ctx.data_mut(|data| {
-                            data.remove::<egui::Vec2>(start_size_id);
-                            data.remove::<egui::Pos2>(start_pos_id);
-                        });
-                    }
-                });
+        let paint = OverlayPaint {
+            label: format!("{} {}\n{}", style.icon, style.label, node.display_title()),
+            fill: Color32::from_rgba_unmultiplied(red, green, blue, alpha),
+            outline: Color32::from_rgba_unmultiplied(255, 40, 40, alpha),
+            title: Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
+            selected,
+            locked,
+            hidden,
+        };
+        // Deferred windows repaint on their own schedule, so tell this one when its look changed.
+        if state.paint.get(key) != Some(&paint) {
+            state.paint.insert(key.to_owned(), paint.clone());
+            ctx.request_repaint_of(id);
+        }
+        let name = key.to_owned();
+        let clicks = Arc::clone(&state.clicks);
+        ctx.show_viewport_deferred(id, builder, move |ui, _| {
+            overlay_window_ui(ui, &name, &paint, &clicks);
         });
 
-        if running { return; }
+        if hidden { return; }
+        if state.targets.contains_key(key) {
+            // A newly created window may not have rendered yet; poll until its geometry arrives.
+            ctx.request_repaint();
+        }
         let (inner, outer, scale) = ctx.input_for(id, |input| {
             let viewport = input.viewport();
             (viewport.inner_rect, viewport.outer_rect, input.pixels_per_point)
@@ -2591,6 +2654,80 @@ impl App {
         if scale.is_finite() && scale > 0.0 {
             state.scales.insert(key.to_owned(), scale);
         }
+    }
+}
+
+/// UI for one deferred overlay window. It repaints independently of the editor, so panning and
+/// zooming the canvas no longer re-renders every region window.
+fn overlay_window_ui(ui: &mut egui::Ui, name: &str, paint: &OverlayPaint, clicks: &Mutex<Vec<String>>) {
+    if paint.hidden {
+        return;
+    }
+    let viewport_ctx = ui.ctx().clone();
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            let grip = paint_overlay(ui, rect, &paint.label, paint.fill, paint.outline, paint.title, paint.selected);
+            let drag = ui.interact(rect, ui.id().with("move-overlay"), egui::Sense::click_and_drag());
+            if drag.drag_started()
+                && drag
+                    .interact_pointer_pos()
+                    .is_some_and(|position| !grip.contains(position))
+            {
+                viewport_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            let resize =
+                ui.interact(grip, ui.id().with("resize-grip"), egui::Sense::drag());
+            if !paint.locked && (drag.clicked() || drag.drag_started() || resize.drag_started()) {
+                clicks.lock().expect("overlay clicks").push(name.to_owned());
+                viewport_ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            let start_size_id = Id::new(("overlay-resize-start", &name));
+            let start_pos_id = Id::new(("overlay-resize-start-pos", &name));
+            if resize.drag_started() {
+                if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                    viewport_ctx.data_mut(|data| {
+                        data.insert_temp(start_size_id, rect.size());
+                        data.insert_temp(start_pos_id, pos);
+                    });
+                }
+            }
+            if resize.dragged() {
+                let start_size =
+                    viewport_ctx.data(|data| data.get_temp::<egui::Vec2>(start_size_id));
+                if let (Some(start_size), Some(current_pos)) =
+                    (start_size, ui.ctx().pointer_latest_pos())
+                {
+                    let start_pos = viewport_ctx
+                        .data(|data| data.get_temp::<egui::Pos2>(start_pos_id))
+                        .unwrap_or(current_pos);
+                    let delta = current_pos - start_pos;
+                    let size = (start_size + egui::vec2(delta.x, delta.y)).max(overlay_min_inner_size());
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        size,
+                    ));
+                }
+            }
+            if resize.drag_stopped() {
+                viewport_ctx.data_mut(|data| {
+                    data.remove::<egui::Vec2>(start_size_id);
+                    data.remove::<egui::Pos2>(start_pos_id);
+                });
+            }
+        });
+    // The parent reads this window's geometry and display scale on its own frames; wake it
+    // whenever they change so saved regions and scales never go stale.
+    let geometry = viewport_ctx.input(|input| {
+        let viewport = input.viewport();
+        (viewport.inner_rect, viewport.outer_rect, input.pixels_per_point)
+    });
+    let geometry_id = Id::new(("overlay-geometry", name));
+    let previous = viewport_ctx
+        .data(|data| data.get_temp::<(Option<egui::Rect>, Option<egui::Rect>, f32)>(geometry_id));
+    if previous != Some(geometry) {
+        viewport_ctx.data_mut(|data| data.insert_temp(geometry_id, geometry));
+        viewport_ctx.request_repaint_of(ViewportId::ROOT);
     }
 }
 
@@ -2686,6 +2823,7 @@ impl App {
     }
 
     fn set_running(&mut self, running: bool) {
+        self.cancel_pending_previews();
         if self.running != running {
             if running {
                 match self.graph.settings.run_mode {
@@ -2731,7 +2869,7 @@ impl App {
     fn handle_escape(&mut self, ctx: &egui::Context) {
         let global = self.escape_pressed.swap(false, Ordering::Relaxed);
         let local = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        if self.running && (global || local) {
+        if (self.running || self.has_pending_preview()) && (global || local) {
             self.set_running(false);
             self.record_status(log::Level::Info, "Stopped (Esc)".into());
         }
@@ -2781,6 +2919,7 @@ impl eframe::App for App {
         self.show_editor_windows(&ctx);
         self.capture_history(&ctx);
         self.autosave(&ctx);
+        self.poll_preview(&ctx);
 
         if self.running {
             if self.graph.settings.run_mode == RunMode::HmiEvent {
@@ -3193,38 +3332,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_embed_viewports(false);
         let rendered = Rc::new(RefCell::new(Vec::new()));
-        let captured = rendered.clone();
         let events = Rc::new(RefCell::new(HashMap::<ViewportId, Vec<egui::Event>>::new()));
-        let viewport_events = events.clone();
-        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
-            let visible = viewport.builder.visible.unwrap();
-            let position = viewport.builder.position.unwrap();
-            let size = viewport.builder.inner_size.unwrap();
-            let rect = if visible {
-                egui::Rect::from_min_size(position, size)
-            } else {
-                egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1.0, 1.0))
-            };
-            let mut input = egui::RawInput {
-                viewport_id: viewport.ids.this,
-                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
-                events: viewport_events.borrow_mut().remove(&viewport.ids.this).unwrap_or_default(),
-                ..Default::default()
-            };
-            input.viewports.insert(viewport.ids.this, egui::ViewportInfo {
-                parent: Some(viewport.ids.parent),
-                inner_rect: Some(rect),
-                outer_rect: Some(rect),
-                native_pixels_per_point: Some(if visible { 1.5 } else { 3.0 }),
-                ..Default::default()
-            });
-            let mut output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
-            let highlighted = output.shapes.iter().any(|shape| {
-                matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == NODE_SELECTED)
-            });
-            captured.borrow_mut().push((visible, output.shapes.len(), highlighted));
-            output.textures_delta.clear();
-        });
         let mut app = app();
         app.kind = 0;
         app.add_node();
@@ -3232,12 +3340,52 @@ mod tests {
         nested.add_node(Node::new("nested_ocr", Kind::Ocr { single_line: false, last_hash: None })).unwrap();
         app.graph.add_node(Node::new("subflow", Kind::Subflow { graph: Box::new(nested) })).unwrap();
         app.selected = None;
+        let root_key = region_key("", &app.graph.nodes[0].name);
+        let overlay_ids = [
+            ViewportId::from_hash_of(("overlay", root_key.as_str())),
+            ViewportId::from_hash_of(("overlay", "subflow/nested_ocr")),
+        ];
 
         let draw = |app: &mut App| {
             rendered.borrow_mut().clear();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_overlays(ui.ctx()));
             output.textures_delta.clear();
+            // Deferred overlays render on their own; drive each child viewport like eframe would.
+            for id in &overlay_ids {
+                let viewport = &output.viewport_output[id];
+                let cb = viewport.viewport_ui_cb.clone().expect("deferred overlay callback");
+                let visible = viewport.builder.visible.unwrap();
+                let position = viewport.builder.position.unwrap();
+                let size = viewport.builder.inner_size.unwrap();
+                let rect = if visible {
+                    egui::Rect::from_min_size(position, size)
+                } else {
+                    egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1.0, 1.0))
+                };
+                let mut input = egui::RawInput {
+                    viewport_id: *id,
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                    events: events.borrow_mut().remove(id).unwrap_or_default(),
+                    ..Default::default()
+                };
+                input.viewports.insert(*id, egui::ViewportInfo {
+                    parent: Some(ViewportId::ROOT),
+                    inner_rect: Some(rect),
+                    outer_rect: Some(rect),
+                    native_pixels_per_point: Some(if visible { 1.5 } else { 3.0 }),
+                    ..Default::default()
+                });
+                let mut child = ctx.run_ui(input, |ui| cb(ui));
+                let highlighted = child.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect) if rect.fill == NODE_SELECTED)
+                });
+                rendered.borrow_mut().push((visible, child.shapes.len(), highlighted));
+                child.textures_delta.clear();
+            }
             assert_eq!(rendered.borrow().len(), 2);
+            // A second parent pass consumes child geometry, scales, and clicks.
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_overlays(ui.ctx()));
+            output.textures_delta.clear();
         };
         draw(&mut app);
         let original = app.graph.to_json();
@@ -3257,7 +3405,6 @@ mod tests {
             }
             draw(app);
         };
-        let root_key = region_key("", &app.graph.nodes[0].name);
         click(&mut app, &root_key, Pos2::new(12.0, 10.0));
         assert_eq!(app.selected, Some(0));
         assert_eq!(rendered.borrow().iter().map(|entry| entry.2).collect::<Vec<_>>(), [true, false]);
@@ -3301,6 +3448,27 @@ mod tests {
             assert_eq!(app.graph.to_json(), original);
             assert_eq!(app.region_scales, scales);
         }
+        app.overlays_enabled = false;
+        draw(&mut app);
+        assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| !visible && shapes == 0));
+        assert_eq!(app.graph.to_json(), original);
+        assert_eq!(app.region_scales, scales);
+        assert!(app.overlay_ready_at.unwrap() > Instant::now());
+        app.selected = Some(0);
+        draw(&mut app);
+        assert_eq!(
+            rendered.borrow().iter().map(|&(visible, _, highlighted)| (visible, highlighted)).collect::<Vec<_>>(),
+            [(true, true), (false, false)],
+            "the selected node's overlay must show even when overlays are hidden",
+        );
+        assert_eq!(app.region_scales, scales);
+        app.selected = None;
+        draw(&mut app);
+        assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| !visible && shapes == 0));
+        app.overlays_enabled = true;
+        draw(&mut app);
+        assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| visible && shapes > 0));
+        assert_eq!(app.region_scales, scales);
     }
 
     #[test]

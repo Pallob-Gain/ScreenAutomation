@@ -1,3 +1,4 @@
 target/
+tests/
 Cargo.lock.bak
 ./desktop.ini

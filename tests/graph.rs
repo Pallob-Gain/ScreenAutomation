@@ -1,6 +1,6 @@
 use screen_automation::backend::{Backend, Region};
 use screen_automation::graph::{EventRuntime, Graph, NodeEvent, RunMode};
-use screen_automation::node::{CompareOp, Crossing, Format, Kind, Node, Value};
+use screen_automation::node::{CompareOp, Crossing, Format, Kind, Node, ScriptLanguage, Value};
 
 #[test]
 fn named_groups_preserve_empty_groups_and_discover_legacy_assignments() {
@@ -286,7 +286,7 @@ fn compare_inputs_routes_a_and_b_caches_values_and_can_trigger_false() {
 fn compare_inputs_waits_for_both_and_clears_cached_data_on_rewiring() {
     let mut graph = Graph::default();
     graph.add_node(Node::new("left", Kind::Constant { value: "10".into(), format: Format::Int })).unwrap();
-    graph.add_node(Node::new("right", Kind::Function { code: "()".into() })).unwrap();
+    graph.add_node(Node::new("right", Kind::Function { code: "()".into(), input_names: Vec::new(), language: ScriptLanguage::Rhai })).unwrap();
     graph.add_node(input_comparison(true)).unwrap();
     graph.connect_input("left", "pair", 0).unwrap();
     graph.connect_input("right", "pair", 1).unwrap();
@@ -294,16 +294,16 @@ fn compare_inputs_waits_for_both_and_clears_cached_data_on_rewiring() {
     assert!(graph.connect_input("left", "pair", 2).is_err());
     let mut backend = Fake::default();
     assert_eq!(graph.run_once(&mut backend).unwrap()["pair"], None);
-    let Kind::Function { code } = &mut graph.nodes[1].kind else { unreachable!() };
+    let Kind::Function { code, .. } = &mut graph.nodes[1].kind else { unreachable!() };
     *code = "5".into();
     assert_eq!(graph.run_once(&mut backend).unwrap()["pair"], Some(Value::Bool(true)));
     graph.disconnect_input("right", "pair", 1);
     assert_eq!(graph.run_once(&mut backend).unwrap()["pair"], None);
-    let Kind::Function { code } = &mut graph.nodes[1].kind else { unreachable!() };
+    let Kind::Function { code, .. } = &mut graph.nodes[1].kind else { unreachable!() };
     *code = "()".into();
     graph.connect_input("right", "pair", 1).unwrap();
     assert_eq!(graph.run_once(&mut backend).unwrap()["pair"], None);
-    let Kind::Function { code } = &mut graph.nodes[1].kind else { unreachable!() };
+    let Kind::Function { code, .. } = &mut graph.nodes[1].kind else { unreachable!() };
     *code = "5".into();
     assert_eq!(graph.run_once(&mut backend).unwrap()["pair"], Some(Value::Bool(true)));
     graph.remove_node("right");
@@ -606,6 +606,8 @@ fn build() -> Graph {
         "fn",
         Kind::Function {
             code: "if inputs[0] > 10.0 { \"go\" } else { () }".into(),
+            input_names: Vec::new(),
+            language: ScriptLanguage::Rhai,
         },
     ))
     .unwrap();

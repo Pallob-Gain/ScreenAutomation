@@ -245,6 +245,11 @@ impl Graph {
                         });
                     }
                 }
+                Kind::Function { .. } => {
+                    if let Err(error) = node.validate_function_inputs() {
+                        add(error);
+                    }
+                }
                 _ => {}
             }
             let optional_input = matches!(node.kind, Kind::Function { .. })
@@ -315,6 +320,56 @@ impl Graph {
 
     pub fn connect(&mut self, src: &str, dst: &str) -> Result<(), String> {
         self.connect_input(src, dst, 0)
+    }
+
+    /// Appends a named input pin to a Function node. Existing wires keep their pins; turning a
+    /// multi-wired single-pin Function into named pins is refused to avoid dropping wires.
+    pub fn add_function_input(&mut self, node: &str, name: &str) -> Result<(), String> {
+        crate::node::validate_input_names(std::slice::from_ref(&name.to_owned()))?;
+        let target = self.nodes.iter().find(|n| n.name == node).ok_or("unknown node")?;
+        let names = target.named_function_inputs();
+        if !matches!(target.kind, Kind::Function { .. }) {
+            return Err("named inputs require a Function node".into());
+        }
+        if names.iter().any(|existing| existing == name) {
+            return Err(format!("duplicate input name '{name}'"));
+        }
+        if names.is_empty() && self.edges.iter()
+            .filter(|edge| edge.target == node && edge.input == 0).take(2).count() > 1 {
+            return Err("Input has multiple connections; named inputs allow one wire per pin. Disconnect the extra wires first".into());
+        }
+        let target = self.nodes.iter_mut().find(|n| n.name == node).expect("found above");
+        let Kind::Function { input_names, .. } = &mut target.kind else { unreachable!() };
+        input_names.push(name.to_owned());
+        target.reset_input_state();
+        Ok(())
+    }
+
+    /// Removes a Function node's named input pin, dropping its wire and shifting later pins up.
+    pub fn remove_function_input(&mut self, node: &str, index: usize) -> Result<(), String> {
+        let target = self.nodes.iter_mut().find(|n| n.name == node).ok_or("unknown node")?;
+        let Kind::Function { input_names, .. } = &mut target.kind else {
+            return Err("named inputs require a Function node".into());
+        };
+        if index >= input_names.len() {
+            return Err("unknown input port".into());
+        }
+        input_names.remove(index);
+        target.reset_input_state();
+        self.edges.retain_mut(|edge| {
+            if edge.target != node {
+                return true;
+            }
+            match edge.input.cmp(&index) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => false,
+                std::cmp::Ordering::Greater => {
+                    edge.input -= 1;
+                    true
+                }
+            }
+        });
+        Ok(())
     }
 
     pub fn set_parameter_input(
@@ -471,6 +526,7 @@ impl Graph {
         &mut self, i: usize, outputs: &mut HashMap<String, Option<Value>>,
         backend: &mut dyn Backend, injected: Option<&Value>, depth: usize,
     ) -> Result<(Vec<Value>, Option<Value>), String> {
+        self.nodes[i].workflow_busy = self.has_pending_waits();
         let name = self.nodes[i].name.clone();
         let parents: Vec<&Edge> = self.edges.iter().filter(|edge| edge.target == name).collect();
         let value_for = |edge: &Edge| outputs.get(&edge.source).cloned().flatten();
@@ -572,6 +628,7 @@ impl Graph {
                 outputs.get(&edge.source).cloned()
                     .unwrap_or_else(|| runtime.values.get(&edge.source).cloned())
             };
+            self.nodes[index].workflow_busy = self.has_pending_waits();
             let out = if self.nodes[index].has_single_connection_ports() {
                 let node = &self.nodes[index];
                 let dynamic = !node.input_parameters.is_empty();

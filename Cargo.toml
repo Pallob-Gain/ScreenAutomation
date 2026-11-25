@@ -40,6 +40,7 @@ directories = { version = "6", optional = true }
 ureq = { version = "2.12", optional = true }
 rfd = { version = "0.15", optional = true }
 cpal = { version = "0.15", optional = true }
+boa_engine = "0.22.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }

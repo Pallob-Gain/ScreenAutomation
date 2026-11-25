@@ -14,6 +14,7 @@ impl App {
             group_dialog: None,
             regex_dialog: None,
             running: false,
+            overlays_enabled: true,
             overlays_hidden: false,
             overlay_ready_at: None,
             last_tick: Instant::now(),
@@ -31,6 +32,8 @@ impl App {
             escape_pressed: Arc::new(AtomicBool::new(false)),
             overlay_anchors: HashMap::new(),
             overlay_targets: HashMap::new(),
+            overlay_clicks: Arc::new(Mutex::new(Vec::new())),
+            overlay_paint: HashMap::new(),
             file: None,
             saved_graph: Graph::default().to_json(),
             pending_file_action: None,
@@ -48,6 +51,7 @@ impl App {
             validation_open: false,
             validation: Vec::new(),
             preview: None,
+            pending_preview: None,
             preview_steps: Vec::new(),
             preview_open: false,
             subflow_editor: None,
@@ -373,6 +377,46 @@ impl App {
     pub(super) fn preview_run(&mut self, single_step: bool) {
         self.set_running(false);
         self.preview_open = true;
+        self.pending_preview = Some(single_step);
+    }
+
+    pub(super) fn has_pending_preview(&self) -> bool {
+        self.pending_preview.is_some()
+            || self.subflow_editor.as_ref().is_some_and(|(_, editor)| editor.has_pending_preview())
+    }
+
+    pub(super) fn cancel_pending_previews(&mut self) {
+        self.pending_preview = None;
+        if let Some((_, editor)) = &mut self.subflow_editor {
+            editor.cancel_pending_previews();
+        }
+    }
+
+    pub(super) fn poll_preview(&mut self, ctx: &egui::Context) {
+        if !self.has_pending_preview() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.overlays_hidden {
+            ctx.request_repaint();
+        } else if let Some(ready) = self.overlay_ready_at.filter(|ready| now < *ready) {
+            ctx.request_repaint_after(ready.duration_since(now));
+        } else {
+            self.execute_pending_previews();
+            ctx.request_repaint();
+        }
+    }
+
+    fn execute_pending_previews(&mut self) {
+        if let Some(single_step) = self.pending_preview.take() {
+            self.execute_preview(single_step);
+        }
+        if let Some((_, editor)) = &mut self.subflow_editor {
+            editor.execute_pending_previews();
+        }
+    }
+
+    fn execute_preview(&mut self, single_step: bool) {
         if !single_step
             || self
                 .preview
@@ -532,6 +576,9 @@ impl App {
         }
         if restart {
             self.preview_run(false);
+        }
+        if !self.preview_open {
+            self.pending_preview = None;
         }
         self.show_recovery(ctx);
     }
@@ -1152,6 +1199,7 @@ mod tests {
     #[test]
     fn preview_steps_actions_without_a_real_input_backend() {
         let mut app = app();
+        let ctx = egui::Context::default();
         app.kind = 9;
         app.add_node();
         app.kind = 7;
@@ -1162,16 +1210,43 @@ mod tests {
         app.region_scales.insert(target, 1.0);
         let original = app.graph.to_json();
         app.preview_run(true);
+        app.poll_preview(&ctx);
+        assert!(app.preview_steps.is_empty(), "must hide overlays before executing");
+        app.overlays_hidden = true;
+        app.overlay_ready_at = Some(Instant::now() + OVERLAY_SETTLE_DELAY);
+        app.poll_preview(&ctx);
+        assert!(app.preview_steps.is_empty(), "must let hidden overlays settle");
+        app.overlay_ready_at = Some(Instant::now() - OVERLAY_SETTLE_DELAY);
+        app.poll_preview(&ctx);
         assert_eq!(app.preview_steps.len(), 1);
         assert!(app.preview_steps[0].actions.is_empty());
         app.preview_run(true);
+        app.poll_preview(&ctx);
         assert_eq!(app.preview_steps.len(), 2);
         assert!(!app.preview_steps[1].actions.is_empty());
         assert_eq!(app.graph.to_json(), original);
         assert!(!app.running);
         app.preview_run(false);
+        app.poll_preview(&ctx);
         assert_eq!(app.preview_steps.len(), 2);
         assert!(!app.status.contains("stopped"));
+    }
+
+    #[test]
+    fn pending_subflow_preview_is_hidden_and_cancelled_with_parent() {
+        let mut parent = app();
+        let mut child = app();
+        child.preview_run(false);
+        parent.subflow_editor = Some(("embedded".into(), Box::new(child)));
+        let ctx = egui::Context::default();
+        assert!(parent.has_pending_preview());
+        parent.poll_preview(&ctx);
+        assert!(parent.subflow_editor.as_ref().unwrap().1.preview.is_none());
+        parent.set_running(false);
+        assert!(!parent.has_pending_preview());
+        parent.overlays_hidden = true;
+        parent.poll_preview(&ctx);
+        assert!(parent.subflow_editor.as_ref().unwrap().1.preview.is_none());
     }
 
     #[test]

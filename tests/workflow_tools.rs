@@ -1,7 +1,7 @@
 use screen_automation::backend::{Backend, KeyAction, Region};
 use screen_automation::event_sources::EventSource;
 use screen_automation::graph::{Edge, EventRuntime, Graph, NodeEvent};
-use screen_automation::node::{CompareOp, Format, Kind, Node, TextMatch, Value};
+use screen_automation::node::{CompareOp, Format, Kind, Node, ScriptLanguage, TextMatch, Value};
 use screen_automation::preview::PreviewSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -321,6 +321,280 @@ fn arm_breakout(graph: &mut Graph) {
     graph.reset_runtime();
 }
 
+#[test]
+fn function_state_is_transactional_ephemeral_and_reset_on_script_changes() {
+    let mut node = Node::new("memory", Kind::Function {
+        code: "if !state.contains(\"count\") { state.count = 0; } state.count += 1; state.count".into(),
+        input_names: Vec::new(),
+        language: ScriptLanguage::Rhai,
+    });
+    let mut screen = Screen::new("");
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(1)));
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(2)));
+    let saved = serde_json::to_string(&node).unwrap();
+    let mut loaded: Node = serde_json::from_str(&saved).unwrap();
+    assert_eq!(loaded.process(&[], &mut screen).unwrap(), Some(Value::Int(1)));
+    let mut duplicate = node.duplicate("copy");
+    assert_eq!(duplicate.process(&[], &mut screen).unwrap(), Some(Value::Int(1)));
+    let Kind::Function { code, .. } = &mut node.kind else { unreachable!() };
+    *code = "if !state.contains(\"count\") { state.count = 0; } state.count += 1; if inputs.len() > 0 { throw \"failed\"; } state.count".into();
+    assert!(node.process(&[Value::Bool(true)], &mut screen).unwrap_err().contains("failed"));
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(1)));
+    let Kind::Function { code, .. } = &mut node.kind else { unreachable!() };
+    *code = "state.invalid = [1]; true".into();
+    assert!(node.process(&[], &mut screen).unwrap_err().contains("must be text"));
+}
+
+fn named_function(code: &str, names: &[&str]) -> Kind {
+    Kind::Function {
+        code: code.into(),
+        input_names: names.iter().map(|&name| name.to_owned()).collect(),
+        language: ScriptLanguage::Rhai,
+    }
+}
+
+#[test]
+fn function_named_inputs_bind_variables_and_missing_pins_read_unit() {
+    let mut graph = Graph::default();
+    graph.add_node(Node::new("left", Kind::Constant { value: "2".into(), format: Format::Number })).unwrap();
+    graph.add_node(Node::new("right", Kind::Constant { value: "3".into(), format: Format::Number })).unwrap();
+    graph.add_node(Node::new("sum", named_function(
+        r#"if right == () { "left only: " + left } else { left + right + inputs.len() }"#,
+        &["left", "right"],
+    ))).unwrap();
+    graph.connect_input("left", "sum", 0).unwrap();
+    let mut screen = Screen::new("");
+    let outputs = graph.run_once(&mut screen).unwrap();
+    assert_eq!(outputs["sum"], Some(Value::Text("left only: 2.0".into())));
+    graph.connect_input("right", "sum", 1).unwrap();
+    let outputs = graph.run_once(&mut screen).unwrap();
+    assert_eq!(outputs["sum"], Some(Value::Num(7.0)));
+    assert!(
+        graph.connect_input("left", "sum", 1).unwrap_err().contains("right already has a connection"),
+        "named pins accept one wire each",
+    );
+}
+
+#[test]
+fn function_named_input_changes_reset_state_and_invalid_names_fail_closed() {
+    let mut screen = Screen::new("");
+    let mut node = Node::new("counter", named_function(
+        "if !state.contains(\"count\") { state.count = 0; } state.count += 1; state.count",
+        &["value"],
+    ));
+    assert_eq!(node.process(&[Value::Int(5)], &mut screen).unwrap(), Some(Value::Int(1)));
+    assert_eq!(node.process(&[Value::Int(5)], &mut screen).unwrap(), Some(Value::Int(2)));
+    let Kind::Function { input_names, .. } = &mut node.kind else { unreachable!() };
+    input_names[0] = "reading".into();
+    assert_eq!(node.process(&[Value::Int(5)], &mut screen).unwrap(), Some(Value::Int(1)),
+        "renaming an input must clear saved state");
+    for (bad, message) in [
+        ("1st", "must start with a letter"),
+        ("two words", "must start with a letter"),
+        ("state", "is reserved"),
+        ("reading", "duplicate input name"),
+    ] {
+        let Kind::Function { input_names, .. } = &mut node.kind else { unreachable!() };
+        input_names.truncate(1);
+        input_names.push(bad.into());
+        assert!(node.process(&[Value::Int(5)], &mut screen).unwrap_err().contains(message), "{bad}");
+        let mut graph = Graph::default();
+        graph.add_node(node.duplicate("checked")).unwrap();
+        assert!(graph.validate().iter().any(|issue| issue.message.contains(message)), "{bad}");
+    }
+}
+
+#[test]
+fn function_input_pins_can_be_added_and_removed_with_wires_remapped() {
+    let mut graph = Graph::default();
+    for name in ["a", "b", "c"] {
+        graph.add_node(Node::new(name, Kind::Constant { value: "1".into(), format: Format::Number })).unwrap();
+    }
+    graph.add_node(Node::new("fn", named_function("inputs.len()", &["first", "second", "third"]))).unwrap();
+    graph.connect_input("a", "fn", 0).unwrap();
+    graph.connect_input("b", "fn", 1).unwrap();
+    graph.connect_input("c", "fn", 2).unwrap();
+    graph.remove_function_input("fn", 1).unwrap();
+    assert_eq!(graph.nodes[3].named_function_inputs(), ["first", "third"]);
+    let mut wires: Vec<(String, usize)> = graph.edges.iter()
+        .map(|edge| (edge.source.clone(), edge.input)).collect();
+    wires.sort();
+    assert_eq!(wires, [("a".into(), 0), ("c".into(), 1)], "the removed pin's wire is dropped and later wires move up");
+    assert!(graph.validate().is_empty(), "{:?}", graph.validate());
+    graph.add_function_input("fn", "third").unwrap_err();
+    graph.add_function_input("fn", "fourth").unwrap();
+    assert_eq!(graph.nodes[3].input_count(), 3);
+    assert_eq!(graph.nodes[3].input_label(2), "fourth");
+
+    let mut legacy = Graph::default();
+    legacy.add_node(Node::new("x", Kind::Constant { value: "1".into(), format: Format::Number })).unwrap();
+    legacy.add_node(Node::new("y", Kind::Constant { value: "2".into(), format: Format::Number })).unwrap();
+    legacy.add_node(Node::new("fn", named_function("inputs.len()", &[]))).unwrap();
+    legacy.connect("x", "fn").unwrap();
+    legacy.connect("y", "fn").unwrap();
+    assert!(legacy.add_function_input("fn", "value").unwrap_err().contains("multiple connections"),
+        "naming inputs must not silently drop one of several wires");
+    legacy.disconnect_input("y", "fn", 0);
+    legacy.add_function_input("fn", "value").unwrap();
+    let mut screen = Screen::new("");
+    let outputs = legacy.run_once(&mut screen).unwrap();
+    assert_eq!(outputs["fn"], Some(Value::Int(1)));
+}
+
+fn js_function(code: &str, names: &[&str]) -> Kind {
+    Kind::Function {
+        code: code.into(),
+        input_names: names.iter().map(|&name| name.to_owned()).collect(),
+        language: ScriptLanguage::Javascript,
+    }
+}
+
+#[test]
+fn javascript_named_inputs_bind_variables_and_missing_pins_read_undefined() {
+    let mut graph = Graph::default();
+    graph.add_node(Node::new("left", Kind::Constant { value: "2".into(), format: Format::Number })).unwrap();
+    graph.add_node(Node::new("right", Kind::Constant { value: "3".into(), format: Format::Number })).unwrap();
+    graph.add_node(Node::new("sum", js_function(
+        "right === undefined ? 'left only: ' + left : left + right + inputs.length",
+        &["left", "right"],
+    ))).unwrap();
+    graph.connect_input("left", "sum", 0).unwrap();
+    let mut screen = Screen::new("");
+    let outputs = graph.run_once(&mut screen).unwrap();
+    assert_eq!(outputs["sum"], Some(Value::Text("left only: 2".into())));
+    graph.connect_input("right", "sum", 1).unwrap();
+    let outputs = graph.run_once(&mut screen).unwrap();
+    assert_eq!(outputs["sum"], Some(Value::Int(7)), "integral JS numbers become Int");
+}
+
+#[test]
+fn javascript_state_is_transactional_and_language_changes_reset_it() {
+    let mut screen = Screen::new("");
+    let mut node = Node::new("conv", js_function("[1, 2]", &[]));
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Text("1,2".into())),
+        "unsupported results fall back to their text form");
+    let set_code = |node: &mut Node, next: &str| {
+        let Kind::Function { code, .. } = &mut node.kind else { unreachable!() };
+        *code = next.into();
+    };
+    set_code(&mut node, "null");
+    assert_eq!(node.process(&[], &mut screen).unwrap(), None, "null and undefined stop the flow");
+    set_code(&mut node, "1.5 + inputs[0]");
+    assert_eq!(node.process(&[Value::Int(1)], &mut screen).unwrap(), Some(Value::Num(2.5)));
+    set_code(&mut node, "if (state.count === undefined) { state.count = 0 } state.count += 1; \
+        if (inputs.length > 0) { throw 'failed' } state.count");
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(1)));
+    assert!(node.process(&[Value::Bool(true)], &mut screen).unwrap_err().contains("failed"));
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(2)),
+        "a failed run must not commit state changes");
+    let set_language = |node: &mut Node, next: ScriptLanguage| {
+        let Kind::Function { language, .. } = &mut node.kind else { unreachable!() };
+        *language = next;
+    };
+    set_language(&mut node, ScriptLanguage::Rhai);
+    assert!(node.process(&[], &mut screen).is_err(), "the JavaScript code is not valid Rhai");
+    set_language(&mut node, ScriptLanguage::Javascript);
+    assert_eq!(node.process(&[], &mut screen).unwrap(), Some(Value::Int(1)),
+        "switching the language clears saved state");
+    set_code(&mut node, "state.bad = [1]; true");
+    assert!(node.process(&[], &mut screen).unwrap_err().contains("must be text"));
+}
+
+fn ibkr_readings(price: &str, side: &str) -> VecDeque<String> {
+    [
+        price.into(), if side == "Buy" { "Position -" } else { "Position 1" }.into(),
+        "SIMULATED TRADING".into(), "NVDA".into(),
+        if side == "Buy" { "Position -" } else { "Position 1" }.into(), "Quantity".into(), "1".into(),
+        "Market".into(), format!("{} 1 shares NVDA", side.to_uppercase()),
+        side.into(), "1".into(), "Market".into(),
+        if side == "Buy" { "0" } else { "1" }.into(),
+        "SIMULATED TRADING".into(), "Your order has been filled".into(),
+        format!("{} 1 NVDA Market", if side == "Buy" { "Bought" } else { "Sold" }),
+        if side == "Buy" { "Position 1" } else { "Position -" }.into(),
+    ].into_iter().collect()
+}
+
+#[test]
+fn ibkr_fixture_repeats_exact_one_cent_round_trips_without_averaging_or_shorting() {
+    let mut graph = Graph::from_json(include_str!("trading-ibkr-paper.json")).unwrap();
+    assert!(graph.validate().is_empty(), "{:?}", graph.validate());
+    let mut screen = Screen::new("");
+    screen.script = ["155.00", "Position -"].map(String::from).into();
+    graph.run_once(&mut screen).unwrap();
+    assert!(screen.actions.is_empty());
+    arm_breakout(&mut graph);
+    screen.script = ["155.00", "Position -"].map(String::from).into();
+    graph.run_once(&mut screen).unwrap();
+    let buy = ["click", "key SelectAll", "type 1", "key Tab", "click", "click", "click", "click", "click"];
+    let sell = ["click", "click", "key SelectAll", "type 1", "key Tab", "click", "click", "click", "click", "click"];
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        screen.advance(1000);
+        screen.script = ibkr_readings("155.01", "Buy");
+        graph.run_once(&mut screen).unwrap();
+        assert!(screen.script.is_empty());
+        expected.extend(buy.map(String::from));
+        assert_eq!(screen.actions, expected);
+        screen.script = ["155.01", "Position 1"].map(String::from).into();
+        graph.run_once(&mut screen).unwrap();
+        screen.advance(1000);
+        screen.script = ["155.02", "Position 1"].map(String::from).into();
+        graph.run_once(&mut screen).unwrap();
+        assert_eq!(screen.actions, expected, "continued rise must not buy while holding");
+        screen.advance(1000);
+        screen.script = ibkr_readings("155.01", "Sell");
+        graph.run_once(&mut screen).unwrap();
+        assert!(screen.script.is_empty());
+        expected.extend(sell.map(String::from));
+        assert_eq!(screen.actions, expected);
+        screen.script = ["155.01", "Position -"].map(String::from).into();
+        graph.run_once(&mut screen).unwrap();
+        screen.advance(1000);
+        screen.script = ["155.00", "Position -"].map(String::from).into();
+        graph.run_once(&mut screen).unwrap();
+        assert_eq!(screen.actions, expected, "continued fall must not sell while flat");
+    }
+}
+
+#[test]
+fn ibkr_fixture_blocks_reentry_during_waits_and_stops_on_bad_review_or_position() {
+    for bad in ["position", "blank", "unlabeled", "review", "busy"] {
+        let mut graph = Graph::from_json(include_str!("trading-ibkr-paper.json")).unwrap();
+        arm_breakout(&mut graph);
+        let mut screen = Screen::new("");
+        screen.script = ["155.00", "Position -"].map(String::from).into();
+        graph.run_once(&mut screen).unwrap();
+        screen.script = ibkr_readings("155.01", "Buy");
+        if matches!(bad, "position" | "blank" | "unlabeled") {
+            screen.script[1] = match bad {
+                "position" => "Position 2",
+                "blank" => "",
+                _ => "-",
+            }.into();
+            assert!(graph.run_once(&mut screen).unwrap_err().contains("position OCR"));
+            assert!(screen.actions.is_empty());
+        } else if bad == "review" {
+            screen.script[11] = "Limit".into();
+            assert!(graph.run_once(&mut screen).unwrap_err().contains("buy_review_type"));
+            assert_eq!(screen.actions.len(), 6, "must not transmit");
+        } else {
+            screen.script.truncate(15);
+            screen.script[14] = "Submitted".into();
+            graph.run_once(&mut screen).unwrap();
+            assert!(graph.has_pending_waits());
+            let count = screen.actions.len();
+            screen.advance(1000);
+            screen.script = ["155.00", "Position 1", "Submitted"].map(String::from).into();
+            graph.run_once(&mut screen).unwrap();
+            assert_eq!(screen.actions.len(), count, "price reversal during a wait must not start a sell");
+            screen.advance(60000);
+            screen.script = ["155.00", "Position 1"].map(String::from).into();
+            assert!(graph.run_once(&mut screen).unwrap_err().contains("timed out"));
+            assert_eq!(screen.actions.len(), count);
+        }
+    }
+}
+
 fn breakout_readings(side: &str, held: usize) -> VecDeque<String> {
     [
         format!("{} NVDA 1 POSITION {held}", side.to_uppercase()),
@@ -531,7 +805,7 @@ fn event_context_does_not_run_untriggered_subflow_actions() {
 fn preview_surfaces_node_errors_and_blocks_downstream() {
     let mut graph = Graph::default();
     graph.add_node(constant("source", "12")).unwrap();
-    graph.add_node(Node::new("function", Kind::Function { code: "throw \"bad\"".into() })).unwrap();
+    graph.add_node(Node::new("function", Kind::Function { code: "throw \"bad\"".into(), input_names: Vec::new(), language: ScriptLanguage::Rhai })).unwrap();
     graph.connect("source", "function").unwrap();
     let mut preview = PreviewSession::new(&graph).unwrap();
     let mut backend = Fake::default();
