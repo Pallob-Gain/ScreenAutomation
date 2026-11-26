@@ -4,13 +4,13 @@ use egui_snarl::{
         BackgroundPattern, Grid, NodeLayout, NodeLayoutKind, PinInfo, PinPlacement, SnarlStyle,
         SnarlViewer, SnarlWidget,
     },
-    InPin, OutPin, Snarl,
+    InPin, InPinId, OutPin, OutPinId, Snarl,
 };
 use screen_automation::{
     backend::{Backend, KeyAction, Region},
     desktop::Desktop,
     graph::{EventRuntime, Graph, GraphSettings, NodeEvent, RunMode, DEFAULT_REFRESH_MS},
-    node::{CompareOp, Crossing, Format, InputParameter, Kind, Node, ScriptLanguage, TextMatch, Value},
+    node::{CompareOp, Crossing, FieldVerification, Format, InputParameter, Kind, Node, ScriptLanguage, TextMatch, Value},
     session_log::SessionLog,
     screen_events::{ScreenEvents, ScreenRegion},
     event_sources::{EventRegistration, EventSource, EventSources},
@@ -66,6 +66,7 @@ struct App {
     backend: Option<Desktop>,
     kind: usize,
     selected: Option<usize>,
+    selected_wire: Option<(OutPinId, InPinId)>,
     node_settings_open: bool,
     copy_drag: Option<egui_snarl::NodeId>,
     add_menu_open: bool,
@@ -545,7 +546,7 @@ fn node_description(node: &Node) -> String {
         Kind::WaitForText { expected, .. } => format!("Wait for screen text: {expected}"),
         Kind::AssertText { expected, .. } => format!("Stop on unexpected screen text: {expected}"),
         Kind::Once { armed, fired } => format!("Once gate: {}", if *fired { "latched" } else if *armed { "armed" } else { "disarmed" }),
-        Kind::SetField { .. } => "Select all and replace a field; verify with Wait for text".into(),
+        Kind::SetField { .. } => "Select all, clear and replace a field; optionally verify with OCR".into(),
         Kind::Keypress { key } => format!("Press {}", key.label()),
         Kind::ValidateNumber { .. } => "Reject invalid numeric/OCR readings before they reach actions".into(),
         Kind::Event { event } => format!("Event source: {}", event.label()),
@@ -596,6 +597,11 @@ fn graph_style() -> SnarlStyle {
 // egui-snarl uses this ID for the draggable node frame.
 fn node_frame_id(node: egui_snarl::NodeId) -> Id {
     Id::new(GRAPH_ID).with(("snarl-node", node)).with("frame")
+}
+
+fn wire_response_id(canvas_ui: Id, from: OutPinId, to: InPinId) -> Id {
+    // egui-snarl hashes its Wire's output/input fields into the canvas UI ID.
+    canvas_ui.with((from, to))
 }
 
 fn icon_button(
@@ -730,7 +736,7 @@ fn new_kind(i: usize) -> Kind {
             expected: String::new(), matching: TextMatch::Contains, case_sensitive: false, single_line: false,
         },
         18 => Kind::Once { armed: false, fired: false },
-        19 => Kind::SetField { text: String::new() },
+        19 => Kind::SetField { text: String::new(), verification: None, pending: None },
         20 => Kind::Keypress { key: KeyAction::Tab },
         _ => Kind::SubflowOutput,
     }
@@ -771,6 +777,23 @@ fn regex_input(ui: &mut egui::Ui, text: &mut String) -> bool {
     generate
 }
 
+fn function_code_editor(ui: &mut egui::Ui, code: &mut String) -> egui::Rect {
+    let footer_height = ui.text_style_height(&egui::TextStyle::Body) * 3.0
+        + ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 4.0;
+    let height = (ui.available_height() - footer_height).max(100.0);
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    egui::ScrollArea::vertical()
+        .id_salt("function-code-scroll")
+        .max_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(code)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows((height / row_height).floor().max(5.0) as usize));
+        }).inner_rect
+}
+
 fn format_settings(ui: &mut egui::Ui, format: &mut Format) {
     for (choice, label) in [
         (Format::Text, "Text"),
@@ -787,6 +810,8 @@ struct GraphViewer<'a> {
     status: &'a mut String,
     activity: &'a HashMap<String, (Instant, String)>,
     selected: Option<usize>,
+    selected_wire: Option<(OutPinId, InPinId)>,
+    canvas_ui_id: Option<Id>,
     now: Instant,
     fit: Option<(egui::Rect, egui::Rect)>,
     validation: &'a [screen_automation::graph::GraphIssue],
@@ -870,7 +895,12 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         _: &mut egui::Ui,
         snarl: &mut Snarl<usize>,
     ) -> impl egui_snarl::ui::SnarlPin + 'static {
-        wire_pin(self.input_glow(snarl[pin.id.node], pin.id.input))
+        let info = wire_pin(self.input_glow(snarl[pin.id.node], pin.id.input));
+        if self.selected_wire.is_some_and(|(_, input)| input == pin.id) {
+            info.with_wire_color(NODE_SELECTED)
+        } else {
+            info
+        }
     }
 
     fn outputs(&mut self, node: &usize) -> usize {
@@ -981,6 +1011,7 @@ impl SnarlViewer<usize> for GraphViewer<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<usize>,
     ) {
+        self.canvas_ui_id = Some(ui.id());
         let name = &self.graph.nodes[snarl[node]].name;
         let Some((_, last)) = self.activity.get(name) else {
             return;
@@ -1492,6 +1523,7 @@ impl App {
 
     fn rebuild_snarl(&mut self) {
         self.copy_drag = None;
+        self.selected_wire = None;
         self.snarl = Snarl::new();
         let mut ids = Vec::with_capacity(self.graph.nodes.len());
         for (index, node) in self.graph.nodes.iter_mut().enumerate() {
@@ -1626,19 +1658,35 @@ impl App {
         }
     }
 
+    fn delete_selected_wire(&mut self) {
+        let Some((from, to)) = self.selected_wire.take() else { return; };
+        if !self.snarl.wires().any(|wire| wire == (from, to)) {
+            self.record_status(log::Level::Warn, "Selected connection no longer exists".into());
+            return;
+        }
+        let source = self.graph.nodes[self.snarl[from.node]].name.clone();
+        let target = self.graph.nodes[self.snarl[to.node]].name.clone();
+        self.graph.disconnect_input(&source, &target, to.input);
+        self.snarl.disconnect(from, to);
+        self.record_status(log::Level::Info, format!("Disconnected {source} -> {target} (input {})", to.input + 1));
+    }
+
     fn run_graph(&mut self) {
         if let Some(backend) = self.backend.as_mut() {
             match run_with_physical_regions(&mut self.graph, backend, &self.region_scales) {
                 Ok(outputs) => self.record_outputs(outputs),
                 Err(error) => {
-                    self.set_running(false);
-                    self.record_status(log::Level::Error, error);
+                    self.record_check_error(error);
                 }
             }
         } else {
-            self.record_status(log::Level::Error, "Desktop backend is unavailable".into());
-            self.set_running(false);
+            self.record_check_error("Desktop backend is unavailable".into());
         }
+    }
+
+    fn record_check_error(&mut self, error: String) {
+        self.record_status(log::Level::Error,
+            format!("Check aborted: {error}; workflow remains running for the next check"));
     }
 
     fn record_outputs(&mut self, outputs: HashMap<String, Option<Value>>) {
@@ -1886,11 +1934,7 @@ impl App {
                             }
                         });
                         settings.label(format!("{} expression", language.label()));
-                        settings.add(
-                            egui::TextEdit::multiline(code)
-                                .code_editor()
-                                .desired_rows(5),
-                        );
+                        function_code_editor(settings, code);
                         settings.weak(
                             "The last expression is the result; () in Rhai and undefined/null in \
                              JavaScript stop the flow. Switching the language clears the saved state.",
@@ -2053,10 +2097,32 @@ impl App {
                         }
                         settings.weak("Passes one trigger. Stop/Run does not reset the latch. Loading, duplicating or explicitly resetting runtime does. Never rearm after a submission timeout until you check order history.");
                     }
-                    Kind::SetField { text } => {
+                    Kind::SetField { text, verification, pending } => {
+                        let before = (text.clone(), verification.clone());
                         settings.label("Replacement text (empty uses input)");
-                        screen_action_changed |= settings.text_edit_singleline(text).changed();
-                        settings.weak("Clicks the field, selects all, then types replacement text. Follow with Wait for text to verify the value before submitting.");
+                        settings.text_edit_singleline(text);
+                        let mut enabled = verification.is_some();
+                        if settings.checkbox(&mut enabled, "Verify value with OCR").changed() {
+                            *verification = enabled.then(FieldVerification::default);
+                        }
+                        if let Some(verification) = verification {
+                            settings.checkbox(&mut verification.single_line, "Single-line OCR");
+                            settings.checkbox(&mut verification.numeric, "Match numeric value (100 = 100.00)");
+                            settings.horizontal(|ui| {
+                                ui.label("Verification timeout (ms)");
+                                ui.add(egui::DragValue::new(&mut verification.timeout_ms).range(1..=120_000));
+                            });
+                            settings.horizontal(|ui| {
+                                ui.label("Minimum poll interval (ms)");
+                                ui.add(egui::DragValue::new(&mut verification.poll_ms).range(1..=120_000));
+                            });
+                            settings.weak("Reads the same region without retyping. Output is withheld until OCR matches. Connect subsequent actions to this output. Top-level graphs only.");
+                        }
+                        settings.weak("Clicks the field, selects all, clears with Backspace, then types replacement text. An OCR timeout aborts the check without triggering the next action.");
+                        if before != (text.clone(), verification.clone()) {
+                            *pending = None;
+                            screen_action_changed = true;
+                        }
                     }
                     Kind::Keypress { key } => {
                         let before = *key;
@@ -2290,19 +2356,19 @@ impl App {
             Some((bounds, canvas_rect.shrink(60.0)))
         } else { None };
         self.fit_view = false;
-        let response = graph_widget.show(
-            &mut self.snarl,
-            &mut GraphViewer {
-                graph: &mut self.graph,
-                status: &mut self.status,
-                activity: &self.activity,
-                selected: self.selected,
-                now,
-                fit,
-                validation: &self.validation,
-            },
-            ui,
-        );
+        let mut viewer = GraphViewer {
+            graph: &mut self.graph,
+            status: &mut self.status,
+            activity: &self.activity,
+            selected: self.selected,
+            selected_wire: self.selected_wire,
+            canvas_ui_id: None,
+            now,
+            fit,
+            validation: &self.validation,
+        };
+        let response = graph_widget.show(&mut self.snarl, &mut viewer, ui);
+        let canvas_ui_id = viewer.canvas_ui_id;
         ctx.input_mut(|input| input.modifiers.shift = shift);
         ctx.data_mut(|data| data.insert_temp(Id::new(CANVAS_RESPONSE_ID), response.id));
         if self
@@ -2313,6 +2379,7 @@ impl App {
             ctx.request_repaint();
         }
 
+        let mut node_clicked = false;
         for (node_id, index) in self.snarl.node_ids() {
             if let Some(response) = ctx.read_response(node_frame_id(node_id))
                 .filter(|response| response.clicked())
@@ -2321,10 +2388,28 @@ impl App {
                     self.node_settings_open = false;
                 }
                 self.selected = Some(*index);
+                self.selected_wire = None;
+                node_clicked = true;
                 if response.double_clicked() {
                     self.node_settings_open = true;
                 }
             }
+        }
+        if let Some(id) = canvas_ui_id.filter(|_| !node_clicked) {
+            let clicked = self.snarl.wires().find(|&(from, to)| {
+                ctx.read_response(wire_response_id(id, from, to)).is_some_and(|response| response.clicked())
+            });
+            if let Some(wire) = clicked {
+                self.selected_wire = Some(wire);
+                self.selected = None;
+                self.node_settings_open = false;
+                ctx.request_repaint();
+            } else if response.clicked() {
+                self.selected_wire = None;
+            }
+        }
+        if self.selected_wire.is_some_and(|wire| !self.snarl.wires().any(|current| current == wire)) {
+            self.selected_wire = None;
         }
 
         egui::Area::new(Id::new("canvas-add"))
@@ -2515,6 +2600,7 @@ impl App {
             self.focus_node = Some(self.graph.nodes[index].name.clone());
         }
         self.selected = Some(index);
+        self.selected_wire = None;
         Ok(())
     }
 
@@ -2624,10 +2710,13 @@ impl App {
             overlay_window_ui(ui, &name, &paint, &clicks);
         });
 
-        if hidden { return; }
+        if hidden && state.scales.contains_key(key) { return; }
         if state.targets.contains_key(key) {
             // A newly created window may not have rendered yet; poll until its geometry arrives.
             ctx.request_repaint();
+            if hidden {
+                ctx.request_repaint_of(id);
+            }
         }
         let (inner, outer, scale) = ctx.input_for(id, |input| {
             let viewport = input.viewport();
@@ -2636,6 +2725,13 @@ impl App {
         let Some(inner) = inner else {
             return;
         };
+        if hidden {
+            // Hidden window geometry must not replace the saved capture region.
+            if scale.is_finite() && scale > 0.0 {
+                state.scales.insert(key.to_owned(), scale);
+            }
+            return;
+        }
         if let Some((target, attempts)) = state.targets.get_mut(key) {
             let correction = outer.and_then(|outer| overlay_correction(*target, inner, outer));
             match correction {
@@ -2924,9 +3020,8 @@ impl eframe::App for App {
         if self.running {
             if self.graph.settings.run_mode == RunMode::HmiEvent {
                 if let Err(error) = self.run_hmi_events(&ctx) {
-                    self.set_running(false);
-                    self.record_status(log::Level::Error, format!("HMI Event stopped: {error}"));
-                    ctx.request_repaint();
+                    self.record_check_error(format!("HMI Event: {error}"));
+                    ctx.request_repaint_after(Duration::from_millis(DEFAULT_REFRESH_MS));
                 }
                 return;
             }
@@ -2988,6 +3083,73 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clicking_a_wire_then_delete_removes_only_that_connection_and_supports_undo() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let mut graph = Graph::default();
+        for (name, position, kind) in [
+            ("source", [80.0, 80.0], Kind::Constant { value: "100".into(), format: Format::Text }),
+            ("other", [80.0, 300.0], Kind::Constant { value: "200".into(), format: Format::Text }),
+            ("field", [500.0, 80.0], Kind::Keyboard { text: "value".into() }),
+        ] {
+            let mut node = Node::new(name, kind);
+            node.position = position;
+            graph.add_node(node).unwrap();
+        }
+        graph.connect("source", "field").unwrap();
+        graph.connect("other", "field").unwrap();
+        app.replace_graph(graph, None);
+        for _ in 0..3 { group_ui_frame(&ctx, &mut app, Vec::new()); }
+        let ids: Vec<_> = (0..3).map(|index| app.snarl.node_ids()
+            .find(|(_, value)| **value == index).unwrap().0).collect();
+        let from = ctx.read_response(node_frame_id(ids[0])).unwrap();
+        let to = ctx.read_response(node_frame_id(ids[2])).unwrap();
+        let transform = ctx.layer_transform_to_global(from.layer_id).unwrap();
+        let point = transform * from.rect.right_center().lerp(to.rect.left_center(), 0.5);
+        app.selected = Some(0);
+        group_ui_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(point)]);
+        group_ui_click(&ctx, &mut app, point);
+        assert_eq!(app.selected_wire, Some((
+            OutPinId { node: ids[0], output: 0 }, InPinId { node: ids[2], input: 0 },
+        )));
+        assert_eq!(app.selected, None, "selecting a wire must not leave a node selected for Delete");
+
+        let key = |key, modifiers| egui::Event::Key {
+            key, physical_key: None, pressed: true, repeat: false, modifiers,
+        };
+        let text_id = Id::new("connection-delete-text-field");
+        let mut text = "100".to_owned();
+        for events in [Vec::new(), vec![key(egui::Key::Delete, egui::Modifiers::NONE)]] {
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id)).request_focus();
+                app.handle_shortcuts(ui.ctx(), false);
+            });
+            output.textures_delta.clear();
+            assert_eq!(app.graph.edges.len(), 2, "Delete in a text field must not remove a connection");
+        }
+        ctx.memory_mut(|memory| memory.surrender_focus(text_id));
+        let command = egui::Modifiers::COMMAND;
+        for (events, edges) in [
+            (vec![key(egui::Key::Delete, egui::Modifiers::NONE)], 1),
+            (vec![egui::Event::ModifiersChanged(command), key(egui::Key::Z, command)], 2),
+        ] {
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 750.0))),
+                events, ..Default::default()
+            }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.show_canvas(ui));
+                app.handle_shortcuts(ui.ctx(), false);
+                app.capture_history(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert_eq!(app.graph.nodes.len(), 3);
+            assert_eq!(app.graph.edges.len(), edges);
+            assert_eq!(app.snarl.wires().count(), edges);
+        }
+        assert!(app.graph.edges.iter().any(|edge| edge.source == "other"));
+    }
+
     fn group_ui_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> HashMap<String, Pos2> {
         let mut output = ctx.run_ui(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 900.0))),
@@ -3032,6 +3194,34 @@ mod tests {
         assert!(app.graph.group_names().is_empty());
         app.undo_edit(&ctx, true);
         assert_eq!(app.graph.group_names(), ["Review"]);
+    }
+
+    #[test]
+    fn function_code_editor_fills_resized_available_space() {
+        let ctx = egui::Context::default();
+        let mut code = "let value = 1;\nvalue;".to_owned();
+        let original = code.clone();
+        let mut rectangles = Vec::new();
+        for size in [egui::vec2(400.0, 300.0), egui::vec2(800.0, 600.0)] {
+            let mut rect = egui::Rect::NOTHING;
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        rect = function_code_editor(ui, &mut code);
+                        assert!((rect.width() - ui.max_rect().width()).abs() < 20.0);
+                    });
+                });
+                output.textures_delta.clear();
+            }
+            rectangles.push(rect);
+        }
+        assert!(rectangles[1].width() > rectangles[0].width() + 350.0);
+        assert!(rectangles[1].height() > rectangles[0].height() + 250.0);
+        assert_eq!(code, original);
     }
 
     #[test]
@@ -3387,6 +3577,12 @@ mod tests {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show_overlays(ui.ctx()));
             output.textures_delta.clear();
         };
+        let before_hidden = app.graph.to_json();
+        app.overlays_enabled = false;
+        draw(&mut app);
+        assert_eq!(app.region_scales.len(), 2, "hidden regions must initialize their display scales");
+        assert_eq!(app.graph.to_json(), before_hidden);
+        app.overlays_enabled = true;
         draw(&mut app);
         let original = app.graph.to_json();
         let scales = app.region_scales.clone();
@@ -3439,7 +3635,13 @@ mod tests {
                     app.escape_pressed.store(true, Ordering::Relaxed);
                     app.handle_escape(&ctx);
                 }
-                "error" => app.run_graph(),
+                "error" => {
+                    app.run_graph();
+                    assert!(app.running, "a failed check must not stop the workflow");
+                    draw(&mut app);
+                    assert!(rendered.borrow().iter().all(|&(visible, shapes, _)| !visible && shapes == 0));
+                    app.set_running(false);
+                }
                 _ => app.set_running(false),
             }
             assert!(!app.running);

@@ -86,6 +86,95 @@ pub struct PendingWait {
 fn default_timeout_ms() -> u64 { 10_000 }
 fn default_poll_ms() -> u64 { 100 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldVerification {
+    #[serde(default)]
+    pub numeric: bool,
+    #[serde(default = "default_single_line")]
+    pub single_line: bool,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+}
+
+fn default_single_line() -> bool { true }
+
+impl Default for FieldVerification {
+    fn default() -> Self {
+        Self { numeric: false, single_line: true, timeout_ms: default_timeout_ms(), poll_ms: default_poll_ms() }
+    }
+}
+
+impl FieldVerification {
+    pub(crate) fn validate(&self, expected: &str) -> Result<(), String> {
+        validate_wait_timing(self.timeout_ms, self.poll_ms)?;
+        if self.numeric && !expected.is_empty() && finite_number(expected).is_none() {
+            return Err("numeric field verification requires a finite numeric replacement".into());
+        }
+        Ok(())
+    }
+
+    fn matches(&self, actual: &str, expected: &str) -> bool {
+        if self.numeric {
+            matches!((finite_number(actual), finite_number(expected)), (Some(a), Some(b)) if a == b)
+        } else {
+            actual.trim() == expected.trim()
+        }
+    }
+}
+
+fn finite_number(text: &str) -> Option<f64> {
+    text.trim().parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+pub(crate) fn validate_wait_timing(timeout_ms: u64, poll_ms: u64) -> Result<(), String> {
+    if !(1..=120_000).contains(&timeout_ms) || poll_ms == 0 || poll_ms > timeout_ms {
+        return Err("wait requires timeout 1..120000 ms and poll interval 1..timeout ms".into());
+    }
+    Ok(())
+}
+
+fn poll_screen_text(
+    backend: &mut dyn Backend, region: &Region, name: &str, expected: &str,
+    single_line: bool, timeout_ms: u64, poll_ms: u64, pending: &mut Option<PendingWait>,
+    matches: impl FnOnce(&str) -> Result<bool, String>,
+) -> Result<Option<Value>, String> {
+    let now = backend.now();
+    let state = pending.take().expect("wait initialized");
+    let timeout = || format!("timed out after {timeout_ms} ms waiting for {expected:?}; check screen/order history before retrying");
+    if now.duration_since(state.started) >= Duration::from_millis(timeout_ms) {
+        return Err(timeout());
+    }
+    if now < state.next_poll {
+        *pending = Some(state);
+        return Ok(None);
+    }
+    let reading = (|| {
+        let pixels = backend.capture(region)?;
+        if single_line { backend.ocr_single_line(region, &pixels) }
+            else { backend.ocr(region, &pixels) }
+    })();
+    let actual = match reading {
+        Ok(actual) => actual,
+        Err(error) => {
+            *pending = Some(state);
+            return Err(error);
+        }
+    };
+    if backend.now().duration_since(state.started) >= Duration::from_millis(timeout_ms) {
+        return Err(timeout());
+    }
+    if matches(&actual)? {
+        log::info!("[WAIT] '{name}' matched {expected:?}");
+        Ok(Some(state.input))
+    } else {
+        log::debug!("[WAIT] '{name}' read {actual:?}, expected {expected:?}");
+        *pending = Some(PendingWait { next_poll: now + Duration::from_millis(poll_ms), ..state });
+        Ok(None)
+    }
+}
+
 /// Value flowing between nodes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -384,6 +473,10 @@ pub enum Kind {
     SetField {
         #[serde(default)]
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<FieldVerification>,
+        #[serde(skip)]
+        pending: Option<PendingWait>,
     },
     Keypress {
         key: KeyAction,
@@ -490,7 +583,7 @@ impl Node {
             }
             Kind::Hysteresis { band, .. } | Kind::Threshold { band, .. } => *band = None,
             Kind::ValidateNumber { last, .. } => *last = None,
-            Kind::WaitForText { pending, .. } => *pending = None,
+            Kind::WaitForText { pending, .. } | Kind::SetField { pending, .. } => *pending = None,
             Kind::Once { fired, .. } => *fired = false,
             Kind::Subflow { graph } => graph.reset_runtime(),
             _ => {}
@@ -517,12 +610,12 @@ impl Node {
     }
 
     pub fn is_waiting(&self) -> bool {
-        matches!(&self.kind, Kind::WaitForText { pending: Some(_), .. })
+        matches!(&self.kind, Kind::WaitForText { pending: Some(_), .. } | Kind::SetField { pending: Some(_), .. })
     }
 
     pub(crate) fn cancel_wait(&mut self) {
         match &mut self.kind {
-            Kind::WaitForText { pending, .. } => *pending = None,
+            Kind::WaitForText { pending, .. } | Kind::SetField { pending, .. } => *pending = None,
             Kind::Subflow { graph } => graph.cancel_waits(),
             _ => {}
         }
@@ -632,7 +725,7 @@ impl Node {
                 *last = None;
             }
             Kind::Subflow { graph } => graph.reset_runtime(),
-            Kind::WaitForText { pending, .. } => *pending = None,
+            Kind::WaitForText { pending, .. } | Kind::SetField { pending, .. } => *pending = None,
             _ => {}
         }
     }
@@ -962,15 +1055,36 @@ impl Node {
                 log::info!("[ONCE] '{}' latched; reset explicitly before another attempt", self.name);
                 Ok(Some(input.clone()))
             }
-            Kind::SetField { text } => {
-                let Some(input) = inputs.first() else { return Ok(None) };
-                let text = if text.is_empty() { input.to_text() } else { text.clone() };
-                let (x, y) = region.center();
-                backend.click(x, y, "left")?;
-                backend.press_key(KeyAction::SelectAll)?;
-                backend.type_text(&text)?;
-                log::info!("[SET FIELD] '{}' replaced field with {text:?}; verify with Wait for text", self.name);
-                Ok(Some(Value::Text(text)))
+            Kind::SetField { text, verification, pending } => {
+                if pending.is_none() {
+                    let Some(input) = inputs.first() else { return Ok(None) };
+                    let text = if text.is_empty() { input.to_text() } else { text.clone() };
+                    if let Some(verification) = verification {
+                        verification.validate(&text)?;
+                        if verification.numeric && finite_number(&text).is_none() {
+                            return Err("numeric field verification requires a finite numeric replacement".into());
+                        }
+                    }
+                    let (x, y) = region.center();
+                    backend.click(x, y, "left")?;
+                    backend.press_key(KeyAction::SelectAll)?;
+                    backend.press_key(KeyAction::Backspace)?;
+                    backend.type_text(&text)?;
+                    log::info!("[SET FIELD] '{}' typed {text:?}", self.name);
+                    let Some(verification) = verification else { return Ok(Some(Value::Text(text))) };
+                    let now = backend.now();
+                    *pending = Some(PendingWait {
+                        input: Value::Text(text), started: now,
+                        next_poll: now + Duration::from_millis(verification.poll_ms),
+                    });
+                    log::info!("[SET FIELD] '{}' verifying rendered value with OCR", self.name);
+                    return Ok(None);
+                }
+                let verification = verification.as_ref().expect("pending field verification");
+                let expected = pending.as_ref().expect("pending field value").input.to_text();
+                poll_screen_text(backend, &region, &self.name, &expected,
+                    verification.single_line, verification.timeout_ms, verification.poll_ms, pending,
+                    |actual| Ok(verification.matches(actual, &expected)))
             }
             Kind::Keypress { key } => {
                 let Some(input) = inputs.first() else { return Ok(None) };
@@ -992,37 +1106,16 @@ impl Node {
             }
             Kind::WaitForText { expected, matching, case_sensitive, single_line, timeout_ms, poll_ms, pending } => {
                 matching.validate(expected)?;
-                if !(1..=120_000).contains(timeout_ms) || *poll_ms == 0 || poll_ms > timeout_ms {
-                    return Err("wait requires timeout 1..120000 ms and poll interval 1..timeout ms".into());
-                }
+                validate_wait_timing(*timeout_ms, *poll_ms)?;
                 let now = backend.now();
                 if pending.is_none() {
                     let Some(input) = inputs.first() else { return Ok(None) };
                     *pending = Some(PendingWait { input: input.clone(), started: now, next_poll: now });
                     log::info!("[WAIT] '{}' waiting for {expected:?}, timeout {timeout_ms} ms", self.name);
                 }
-                let state = pending.take().expect("wait initialized");
-                if now.duration_since(state.started) >= Duration::from_millis(*timeout_ms) {
-                    return Err(format!("timed out after {timeout_ms} ms waiting for {expected:?}; check screen/order history before retrying"));
-                }
-                if now < state.next_poll {
-                    *pending = Some(state);
-                    return Ok(None);
-                }
-                let pixels = backend.capture(&region)?;
-                let actual = if *single_line { backend.ocr_single_line(&region, &pixels)? }
-                    else { backend.ocr(&region, &pixels)? };
-                if backend.now().duration_since(state.started) >= Duration::from_millis(*timeout_ms) {
-                    return Err(format!("timed out after {timeout_ms} ms waiting for {expected:?}; check screen/order history before retrying"));
-                }
-                if matching.matches(&actual, expected, *case_sensitive)? {
-                    log::info!("[WAIT] '{}' matched {expected:?}", self.name);
-                    Ok(Some(state.input))
-                } else {
-                    log::debug!("[WAIT] '{}' read {actual:?}", self.name);
-                    *pending = Some(PendingWait { next_poll: now + Duration::from_millis(*poll_ms), ..state });
-                    Ok(None)
-                }
+                poll_screen_text(backend, &region, &self.name, expected,
+                    *single_line, *timeout_ms, *poll_ms, pending,
+                    |actual| matching.matches(actual, expected, *case_sensitive))
             }
             Kind::ValidateNumber { minimum, maximum, max_change, pattern, last } => {
                 let Some(input) = inputs.first() else { return Ok(None) };
@@ -1093,6 +1186,7 @@ fn recognize_changed_frame(
         log::info!("[OCR] No change detected (hash match)");
         return Ok(None);
     }
+    *last_hash = None;
     let result = if single_line {
         backend.ocr_single_line(region, pixels)?
     } else {

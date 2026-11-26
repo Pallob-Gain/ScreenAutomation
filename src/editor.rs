@@ -8,6 +8,7 @@ impl App {
             backend,
             kind: 0,
             selected: None,
+            selected_wire: None,
             node_settings_open: false,
             copy_drag: None,
             add_menu_open: false,
@@ -302,7 +303,9 @@ impl App {
                 self.focus_node = None;
             }
             if shortcut(egui::Modifiers::NONE, egui::Key::Delete) {
-                if let Some(index) = self.selected {
+                if self.selected_wire.is_some() {
+                    self.delete_selected_wire();
+                } else if let Some(index) = self.selected {
                     self.delete_node(index);
                 }
             }
@@ -527,6 +530,7 @@ impl App {
             });
         if let Some(index) = search_selection {
             self.selected = Some(index);
+            self.selected_wire = None;
             self.node_settings_open = true;
             self.focus_node = Some(self.graph.nodes[index].name.clone());
         }
@@ -1456,6 +1460,8 @@ mod tests {
                 status: &mut app.status,
                 activity: &app.activity,
                 selected: None,
+                selected_wire: None,
+                canvas_ui_id: None,
                 now: Instant::now(),
                 fit: None,
                 validation: &[],

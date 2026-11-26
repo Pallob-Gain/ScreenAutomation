@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::node::{InputParameter, Kind, Node, Value};
+use crate::node::{validate_wait_timing, InputParameter, Kind, Node, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -191,11 +191,15 @@ impl Graph {
             match &node.kind {
                 Kind::WaitForText { expected, matching, timeout_ms, poll_ms, .. } => {
                     if let Err(error) = matching.validate(expected) { add(error); }
-                    if !(1..=120_000).contains(timeout_ms) || *poll_ms == 0 || poll_ms > timeout_ms {
-                        add("wait requires timeout 1..120000 ms and poll interval 1..timeout ms".into());
-                    }
+                    if let Err(error) = validate_wait_timing(*timeout_ms, *poll_ms) { add(error); }
                     if subflow {
                         add("wait_for_text must be in the top-level graph, not a subflow".into());
+                    }
+                }
+                Kind::SetField { text, verification: Some(verification), .. } => {
+                    if let Err(error) = verification.validate(text) { add(error); }
+                    if subflow {
+                        add("Set Field OCR verification must be in the top-level graph, not a subflow".into());
                     }
                 }
                 Kind::AssertText { expected, matching, .. } => {
@@ -498,8 +502,9 @@ impl Graph {
     }
 
     pub(crate) fn run_subflow(&mut self, input: Option<Value>, backend: &mut dyn Backend, depth: usize) -> Result<Option<Value>, String> {
-        if self.nodes.iter().any(|node| matches!(node.kind, Kind::WaitForText { .. })) {
-            return Err("wait_for_text must be in the top-level graph, not a subflow".into());
+        if self.nodes.iter().any(|node| matches!(node.kind,
+            Kind::WaitForText { .. } | Kind::SetField { verification: Some(_), .. })) {
+            return Err("wait_for_text and Set Field OCR verification must be in the top-level graph, not a subflow".into());
         }
         if depth > MAX_SUBFLOW_DEPTH {
             return Err("maximum subflow depth exceeded".into());

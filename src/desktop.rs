@@ -5,6 +5,7 @@ use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rten::Model;
 use rten_imageproc::{RectF, RotatedRect};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct Desktop {
@@ -170,7 +171,16 @@ fn recognize_single_line(
     if height >= 24 || !numeric {
         return Ok(text);
     }
-    // Preserve tiny punctuation before the recognizer's interpolated resize.
+    // Preserve thin signs and decimal points in both numeric consensus readings.
+    let (pixels, width, height) = enlarge_single_line(&pixels, width, height);
+    let original = recognize_line(engine, &pixels, width, height)?;
+    let (enlarged, width, height) = enlarge_single_line(&pixels, width, height);
+    let enhanced = recognize_line(engine, &enlarged, width, height)?;
+    validate_numeric_readings(&original, &enhanced)?;
+    Ok(enhanced)
+}
+
+fn enlarge_single_line(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     let mut enlarged = Vec::with_capacity(pixels.len() * 4);
     for y in 0..height * 2 {
         for x in 0..width * 2 {
@@ -178,16 +188,16 @@ fn recognize_single_line(
             enlarged.extend_from_slice(&pixels[start..start + 3]);
         }
     }
-    let enhanced = recognize_line(engine, &enlarged, width * 2, height * 2)?;
-    validate_numeric_readings(&text, &enhanced)?;
-    Ok(enhanced)
+    (enlarged, width * 2, height * 2)
 }
 
 fn validate_numeric_readings(original: &str, enhanced: &str) -> Result<(), String> {
     let original: String = original.split_whitespace().collect();
     let enhanced: String = enhanced.split_whitespace().collect();
+    let original = original.strip_prefix('+').unwrap_or(&original);
+    let enhanced = enhanced.strip_prefix('+').unwrap_or(&enhanced);
     let without_dots = |text: &str| text.chars().filter(|c| *c != '.').collect::<String>();
-    if without_dots(&original) != without_dots(&enhanced)
+    if without_dots(original) != without_dots(enhanced)
         || (original.contains('.') && original != enhanced)
         || enhanced.matches('.').count() > 1
     {
@@ -223,27 +233,53 @@ fn prepare_single_line(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8
     if pixels.len() != expected_len {
         return Err("Single-line OCR requires an RGB pixel buffer matching its region".into());
     }
-    // Single-line regions have a plain background and a small margin around the text.
-    let background = &pixels[..3];
+    // A crop-edge border is not necessarily the text's background.
+    let mut counts = HashMap::new();
+    let mut background = [0; 3];
+    let mut background_count = 0;
+    for pixel in pixels.chunks_exact(3) {
+        let color = [pixel[0], pixel[1], pixel[2]];
+        let count = counts.entry(color).or_insert(0usize);
+        *count += 1;
+        if *count > background_count {
+            background = color;
+            background_count = *count;
+        }
+    }
     let invert = background.iter().map(|&v| u32::from(v)).sum::<u32>() < 3 * 128;
+    let pixel_at = |x: u32, y: u32| {
+        let start = ((y * width + x) * 3) as usize;
+        &pixels[start..start + 3]
+    };
+    let contrasts = |pixel: &[u8]| pixel.iter().zip(background).any(|(&a, b)| a.abs_diff(b) > 32);
+    let (mut x0, mut y0, mut x1, mut y1) = (0, 0, width, height);
+    // Ignore only solid, full-span edge lines, not interior glyphs or punctuation.
+    while y0 < y1 && contrasts(pixel_at(0, y0))
+        && (0..width).all(|x| pixel_at(x, y0) == pixel_at(0, y0)) { y0 += 1; }
+    while y0 < y1 && contrasts(pixel_at(0, y1 - 1))
+        && (0..width).all(|x| pixel_at(x, y1 - 1) == pixel_at(0, y1 - 1)) { y1 -= 1; }
+    while x0 < x1 && y0 < y1 && contrasts(pixel_at(x0, y0))
+        && (y0..y1).all(|y| pixel_at(x0, y) == pixel_at(x0, y0)) { x0 += 1; }
+    while x0 < x1 && y0 < y1 && contrasts(pixel_at(x1 - 1, y0))
+        && (y0..y1).all(|y| pixel_at(x1 - 1, y) == pixel_at(x1 - 1, y0)) { x1 -= 1; }
     let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
-    for (index, pixel) in pixels.chunks_exact(3).enumerate() {
-        if pixel.iter().zip(background).any(|(&a, &b)| a.abs_diff(b) > 32) {
-            let x = index as u32 % width;
-            let y = index as u32 / width;
-            left = left.min(x);
-            right = right.max(x + 1);
-            top = top.min(y);
-            bottom = bottom.max(y + 1);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if contrasts(pixel_at(x, y)) {
+                left = left.min(x);
+                right = right.max(x + 1);
+                top = top.min(y);
+                bottom = bottom.max(y + 1);
+            }
         }
     }
     if right == 0 {
         return Ok((Vec::new(), 0, 0));
     }
-    left = left.saturating_sub(2);
-    top = top.saturating_sub(2);
-    right = (right + 2).min(width);
-    bottom = (bottom + 2).min(height);
+    left = left.saturating_sub(2).max(x0);
+    top = top.saturating_sub(2).max(y0);
+    right = (right + 2).min(x1);
+    bottom = (bottom + 2).min(y1);
     let mut out = Vec::with_capacity(((right - left) * (bottom - top) * 3) as usize);
     for y in top..bottom {
         let start = ((y * width + left) * 3) as usize;
@@ -360,14 +396,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local OCR recognition model"]
+    fn small_balance_ocr_preserves_negative_signs() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests").join("fixtures").join("ocr");
+        let model = find_model(&local_model_dirs(), "text-recognition.onnx")
+            .expect("this test requires a local recognition model");
+        let engine = OcrEngine::new(OcrEngineParams {
+            recognition_model: Some(Model::load_file(model).unwrap()),
+            ..Default::default()
+        }).unwrap();
+        for (file, expected) in [
+            ("negative-balance.rgb", "-100.00"), ("positive-balance.rgb", "560.00"),
+        ] {
+            let pixels = std::fs::read(directory.join(file)).unwrap();
+            let region = Region { x: 0, y: 0, width: 100, height: 18 };
+            let text = recognize_single_line(&engine, &region, &pixels).unwrap();
+            assert_eq!(text.split_whitespace().collect::<String>(), expected, "{file}");
+        }
+    }
+
+    #[test]
     fn numeric_enhancement_rejects_changed_digits_signs_or_existing_decimals() {
         assert!(validate_numeric_readings("$16421", "$ 164.21").is_ok());
+        assert!(validate_numeric_readings("2000.00", "+2000.00").is_ok());
+        assert!(validate_numeric_readings("+2000.00", "2000.00").is_ok());
         for (original, enhanced) in [
             ("$16421", "$164.22"), ("-16421", "164.21"),
             ("$164.21", "$16.421"), ("$164.21", "$16421"), ("$16421", "$$164.21"),
+            ("2000.00", "-2000.00"), ("-2000.00", "+2000.00"),
         ] {
             let error = validate_numeric_readings(original, enhanced).unwrap_err();
             assert!(error.contains("Numeric OCR disagrees between scales"));
+        }
+    }
+
+    #[test]
+    fn single_line_preparation_ignores_empty_borders_but_preserves_interior_text() {
+        let (width, height) = (80u32, 24u32);
+        for background in [0u8, 255u8] {
+            let foreground = 255 - background;
+            let mut pixels = vec![background; (width * height * 3) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    if x == 0 || x == width - 1 || y == 0 || y == height - 1 {
+                        let start = ((y * width + x) * 3) as usize;
+                        pixels[start..start + 3].fill(foreground);
+                    }
+                }
+            }
+            assert_eq!(prepare_single_line(&pixels, width, height).unwrap(), (vec![], 0, 0));
+            // A genuine U inside the crop must remain unreadable text, not become empty.
+            for y in 6..16 {
+                for x in 20..28 {
+                    if x == 20 || x == 27 || y == 15 {
+                        let start = ((y * width + x) * 3) as usize;
+                        pixels[start..start + 3].fill(foreground);
+                    }
+                }
+            }
+            let (prepared, w, h) = prepare_single_line(&pixels, width, height).unwrap();
+            assert_eq!((w, h), (12, 14));
+            assert!(prepared.iter().any(|&value| value == 0), "interior glyph must be preserved");
         }
     }
 
